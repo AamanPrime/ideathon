@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { login, type AuthUser } from "./auth";
+import { ThemeToggle } from "./ThemeToggle";
 
 type Props = {
   onSuccess: (user: AuthUser) => void;
@@ -27,11 +28,11 @@ export default function Login({ onSuccess }: Props) {
 
   return (
     <div className="gate-root">
-      <div className="gate-aurora" />
+      <ThemeToggle />
       <form className="gate-form glass-panel" onSubmit={submit}>
-        <h2>Frontline Desk — Staff sign in</h2>
+        <h2>Frontline Desk</h2>
         <p className="small">
-          Real JWT authentication. Seed admin is created on first launch.
+          Staff sign-in — JWT authentication
         </p>
         <label className="field">
           Email
@@ -58,8 +59,7 @@ export default function Login({ onSuccess }: Props) {
           {busy ? "Signing in…" : "Sign in"}
         </button>
         <p className="small" style={{ marginTop: "0.75rem" }}>
-          Default seed:{" "}
-          <span className="mono">admin@example.com / ChangeMe!123</span>
+          Default: <span className="mono">admin@example.com / ChangeMe!123</span>
         </p>
       </form>
     </div>

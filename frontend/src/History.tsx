@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { apiFetch } from "./auth";
+import { ThemeToggle } from "./ThemeToggle";
 
 type SessionItem = {
   id: string;
@@ -66,9 +67,12 @@ export default function History({ onBack }: Props) {
           <strong>Session history</strong>
           <span>Bilingual interaction records · PII-redacted at rest</span>
         </div>
-        <button type="button" className="secondary btn-compact" onClick={onBack}>
-          ← Back to console
-        </button>
+        <div className="row" style={{ gap: "0.5rem" }}>
+          <button type="button" className="secondary btn-compact" onClick={onBack}>
+            ← Back to console
+          </button>
+          <ThemeToggle />
+        </div>
       </header>
 
       <div className="grid">

@@ -815,6 +815,35 @@ async def desk_ws(
                 fmt = str(msg.get("format") or "wav")
                 await _process_customer_audio(sess, audio_bytes, audio_format=fmt, sample_rate=sr)
 
+            elif mtype == "customer_text":
+                # Text fallback — user typed what customer said (bypasses ASR)
+                raw = (msg.get("text") or "").strip()
+                if not raw:
+                    continue
+                lang = msg.get("lang") or sess.customer_lang
+                translated = raw
+                s = get_settings()
+                if (
+                    not s.demo_mode
+                    and s.bhashini_user_id
+                    and s.bhashini_ulca_api_key
+                    and lang != sess.staff_lang
+                ):
+                    try:
+                        translated = await bhashini.translate_text(
+                            source_lang=lang,
+                            target_lang=sess.staff_lang,
+                            text=raw,
+                        )
+                    except BhashiniError as e:
+                        translated = f"{raw}\n[translate error: {e}]"
+                elif lang != sess.staff_lang:
+                    # Try LLM translation as fallback
+                    translated_text, _engine = await fast_translate(raw, lang, sess.staff_lang)
+                    if translated_text:
+                        translated = translated_text
+                await _finalize_customer_turn(sess, raw, translated, 0.99)
+
             elif mtype == "staff_speak":
                 raw_text = (msg.get("text") or "").strip()
                 text = sanitize_for_llm(raw_text)

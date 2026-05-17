@@ -3,6 +3,7 @@ import { MicCapture } from "./audio/capture";
 import { appendHistory, loadHistory, type CustomerHistoryItem } from "./customerHistory";
 import Login from "./Login";
 import History from "./History";
+import { ThemeToggle } from "./ThemeToggle";
 import {
   apiFetch,
   clearAuth,
@@ -110,17 +111,38 @@ export default function App() {
   const [staffText, setStaffText] = useState(
     "I will help you with account opening. May I verify your mobile number linked to your Aadhaar?"
   );
+  const [staffTranslationPreview, setStaffTranslationPreview] = useState("");
+  const [customerTextInput, setCustomerTextInput] = useState("");
+  const [toasts, setToasts] = useState<{id: number; msg: string; type: "info" | "error" | "ok"}[]>([]);
+  const [sessionLoading, setSessionLoading] = useState(false);
+  const [summaryLoading, setSummaryLoading] = useState(false);
 
   const [privacyRedact, setPrivacyRedact] = useState(false);
   const [fontScale, setFontScale] = useState("1");
   const [highContrast, setHighContrast] = useState(false);
   const [captionsMode, setCaptionsMode] = useState(false);
   const [useBrowserPartial, setUseBrowserPartial] = useState(true);
+  const feedRef = useRef<HTMLDivElement>(null);
+  const staffDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const toastIdRef = useRef(0);
 
   const wsRef = useRef<WebSocket | null>(null);
   const micRef = useRef<MicCapture | null>(null);
   const currentAudioRef = useRef<HTMLAudioElement | null>(null);
   const speechRef = useRef<SpeechRecognition | null>(null);
+
+  const addToast = useCallback((msg: string, type: "info" | "error" | "ok" = "info") => {
+    const id = ++toastIdRef.current;
+    setToasts((prev) => [...prev.slice(-4), { id, msg, type }]);
+    window.setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 4000);
+  }, []);
+
+  // Auto-scroll feed when new messages arrive
+  useEffect(() => {
+    if (feedRef.current) {
+      feedRef.current.scrollTop = feedRef.current.scrollHeight;
+    }
+  }, [lines]);
 
   const refreshHealth = useCallback(async () => {
     try {
@@ -258,7 +280,30 @@ export default function App() {
     await audio.play();
   };
 
+  const sendCustomerText = () => {
+    const text = customerTextInput.trim();
+    if (!text || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    wsRef.current.send(
+      JSON.stringify({ type: "customer_text", text, lang: customerLang })
+    );
+    setCustomerTextInput("");
+    addToast("Customer text sent for translation", "ok");
+  };
+
+  // Staff typing → live translation preview
+  const onStaffTextChange = (val: string) => {
+    setStaffText(val);
+    if (staffDebounceRef.current) clearTimeout(staffDebounceRef.current);
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    staffDebounceRef.current = setTimeout(() => {
+      const t = val.trim();
+      if (t.length < 4) return;
+      wsRef.current?.send(JSON.stringify({ type: "staff_interim", text: t }));
+    }, 400);
+  };
+
   const startSession = async () => {
+    setSessionLoading(true);
     setLines([]);
     setForm({});
     setCopilot(null);
@@ -278,15 +323,23 @@ export default function App() {
       clearAuth();
       setAuthUser(null);
       setPortal("gate");
+      setSessionLoading(false);
       return;
     }
     const data = await r.json();
     if (data.scenarios) setScenarios(data.scenarios as string[]);
+    setSessionLoading(false);
     setSessionId(data.session_id);
     const ws = new WebSocket(wsUrl(`/ws/desk/${data.session_id}`));
     wsRef.current = ws;
-    ws.onopen = () => setConnected(true);
-    ws.onclose = () => setConnected(false);
+    ws.onopen = () => {
+      setConnected(true);
+      addToast("Session connected", "ok");
+    };
+    ws.onclose = () => {
+      setConnected(false);
+      addToast("Session disconnected", "info");
+    };
     ws.onmessage = (ev) => {
       const msg = JSON.parse(ev.data as string);
       if (msg.type === "ready" && msg.scenarios) setScenarios(msg.scenarios as string[]);
@@ -311,10 +364,23 @@ export default function App() {
       }
       if (msg.type === "copilot") setCopilot(msg);
       if (msg.type === "form_prefill") setForm(msg.fields || {});
-      if (msg.type === "tts_audio") void playWavBase64(msg.base64 as string);
+      if (msg.type === "tts_audio") {
+        void playWavBase64(msg.base64 as string);
+        addToast("Playing TTS audio", "ok");
+      }
+      if (msg.type === "tts_error") {
+        addToast(`TTS error: ${msg.message}`, "error");
+      }
+      if (msg.type === "staff_partial_translation") {
+        setStaffTranslationPreview(msg.text_translated as string || "");
+      }
+      if (msg.type === "error") {
+        addToast(`Error: ${msg.message}`, "error");
+      }
       if (msg.type === "session_cleared") {
         setSessionId(null);
         setConnected(false);
+        addToast("Session cleared", "info");
       }
     };
   };
@@ -379,18 +445,27 @@ export default function App() {
 
   const genSummary = async () => {
     if (!sessionId) return;
-    const r = await apiFetch(`/summary`, {
-      method: "POST",
-      body: JSON.stringify({ session_id: sessionId }),
-    });
-    const data = await r.json();
-    const summ = (data.summary || data) as Record<string, unknown>;
-    setSummary(summ);
-    setSummaryMetrics((data.metrics || null) as Record<string, unknown> | null);
-    const ref = servingCustomerRef.trim().toUpperCase();
-    if (ref) {
-      const line = String(summ.summary_staff_lang ?? summ.summary_customer_lang ?? "Session summary").slice(0, 240);
-      appendHistory(ref, { title: "Branch voice-desk session", detail: line });
+    setSummaryLoading(true);
+    addToast("Generating bilingual summary…", "info");
+    try {
+      const r = await apiFetch(`/summary`, {
+        method: "POST",
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+      const data = await r.json();
+      const summ = (data.summary || data) as Record<string, unknown>;
+      setSummary(summ);
+      setSummaryMetrics((data.metrics || null) as Record<string, unknown> | null);
+      const ref = servingCustomerRef.trim().toUpperCase();
+      if (ref) {
+        const line = String(summ.summary_staff_lang ?? summ.summary_customer_lang ?? "Session summary").slice(0, 240);
+        appendHistory(ref, { title: "Branch voice-desk session", detail: line });
+      }
+      addToast("Summary generated", "ok");
+    } catch {
+      addToast("Summary generation failed", "error");
+    } finally {
+      setSummaryLoading(false);
     }
   };
 
@@ -487,7 +562,7 @@ export default function App() {
   if (portal === "customer-login") {
     return (
       <div className="gate-root">
-        <div className="gate-aurora" />
+        <ThemeToggle />
         <div className="gate-form glass-panel customer-login-panel">
           <button type="button" className="link-back" onClick={() => setPortal("gate")}>
             ← Back
@@ -520,7 +595,7 @@ export default function App() {
   if (portal === "customer-kiosk") {
     return (
       <div className="gate-root">
-        <div className="gate-aurora" />
+        <ThemeToggle />
         <div className="gate-form glass-panel kiosk-panel">
           <h2>Welcome</h2>
           <p className="mono accent-mono">{kioskCustomerId}</p>
@@ -556,7 +631,7 @@ export default function App() {
       <header className="topbar topbar-desk">
         <div className="brand">
           <strong>Frontline Desk</strong>
-          <span>Multilingual voice · Bhashini · session-only memory</span>
+          <span>Multilingual voice · Real-time translation</span>
         </div>
         <div className="row topbar-actions">
           <span className="staff-chip">
@@ -583,6 +658,7 @@ export default function App() {
           <button type="button" className="secondary btn-compact" onClick={() => void staffSignOut()}>
             Sign out
           </button>
+          <ThemeToggle />
         </div>
       </header>
 
@@ -658,16 +734,16 @@ export default function App() {
               </div>
             )}
             {!connected ? (
-              <button type="button" onClick={() => void startSession()}>
-                Start secure session
+              <button type="button" onClick={() => void startSession()} disabled={sessionLoading}>
+                {sessionLoading ? "Starting…" : "Start secure session"}
               </button>
             ) : (
               <>
                 <button type="button" className={listening ? "danger" : ""} onClick={() => void toggleListen()}>
                   {listening ? "Stop listening" : "Listen to customer"}
                 </button>
-                <button type="button" className="secondary" onClick={() => void genSummary()}>
-                  Bilingual summary
+                <button type="button" className="secondary" onClick={() => void genSummary()} disabled={summaryLoading}>
+                  {summaryLoading ? "Generating…" : "Bilingual summary"}
                 </button>
                 <button type="button" className="secondary" onClick={() => void exportPacket(false)}>
                   Export JSON
@@ -684,113 +760,105 @@ export default function App() {
 
           {(partialLine || serverPartial) && listening && (
             <div className="partial-box">
-              <strong>Live partial</strong> (browser / server):{" "}
+              <strong>Live partial</strong>:{" "}
               <span className="mono">{displayText(partialLine || serverPartial)}</span>
             </div>
           )}
 
-          <div className="split-console">
-            <div>
-              <div className="small" style={{ marginBottom: "0.35rem" }}>
-                <strong>Customer stream</strong>
+          {/* Customer text input fallback */}
+          {connected && (
+            <div style={{ marginBottom: "0.65rem" }}>
+              <div className="small" style={{ marginBottom: "0.25rem" }}>
+                <strong>Customer text input</strong> (fallback when mic unavailable)
               </div>
-              <div className="feed">
-                {lines.filter((l) => l.role === "customer").length === 0 && (
-                  <div className="small">Customer utterances (with confidence & INR/date hints).</div>
-                )}
-                {lines
-                  .map((l, i) => ({ l, i }))
-                  .filter(({ l }) => l.role === "customer")
-                  .map(({ l, i }) => (
-                    <div key={i} className="bubble customer">
-                      <div className="who">
-                        <span className="mono">Customer</span>
-                        <span className="mono">{l.source_lang}</span>
-                      </div>
-                      {typeof l.confidence === "number" && (
-                        <div className="confidence-bar" title={`ASR confidence ~ ${l.confidence}`}>
-                          <i style={{ width: `${Math.round(l.confidence * 100)}%` }} />
-                        </div>
-                      )}
-                      {l.low_confidence && <div className="small risk-med">Low confidence — consider repeating.</div>}
-                      <div className="small" style={{ marginBottom: "0.35rem" }}>
-                        <strong>Original:</strong> {displayText(l.text_original)}
-                      </div>
-                      <div className="small">
-                        <strong>Staff view:</strong> {displayText(l.text_translated)}
-                      </div>
-                      {!!l.normalized?.hints?.length && (
-                        <div className="small" style={{ marginTop: "0.35rem" }}>
-                          <strong>Normalized hints:</strong> {l.normalized.hints.join(" · ")}
-                        </div>
-                      )}
-                      {!!l.normalized?.normalized_snippets?.length && (
-                        <div className="small">{l.normalized.normalized_snippets.join(" · ")}</div>
-                      )}
-                      {!!l.glossary?.length && (
-                        <div style={{ marginTop: "0.5rem" }}>
-                          {l.glossary.map((g) => (
-                            <span key={g.term} className="tag" title={g.definition}>
-                              {g.term}
-                            </span>
-                          ))}
-                        </div>
-                      )}
-                      {!!l.risk_flags?.length && (
-                        <div style={{ marginTop: "0.5rem" }}>
-                          {l.risk_flags.map((r, j) => (
-                            <span
-                              key={j}
-                              className={`tag ${
-                                r.level === "high" ? "risk-high" : r.level === "medium" ? "risk-med" : "risk-low"
-                              }`}
-                            >
-                              {r.reason}
-                            </span>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  ))}
+              <div className="row">
+                <input
+                  style={{ flex: 1 }}
+                  value={customerTextInput}
+                  onChange={(e) => setCustomerTextInput(e.target.value)}
+                  placeholder={`Type what customer said in ${CUSTOMER_LANGS.find(l => l.code === customerLang)?.label || customerLang}…`}
+                  onKeyDown={(e) => { if (e.key === "Enter") sendCustomerText(); }}
+                />
+                <button type="button" onClick={sendCustomerText} disabled={!customerTextInput.trim()}>
+                  Send
+                </button>
               </div>
             </div>
-            <div>
-              <div className="small" style={{ marginBottom: "0.35rem" }}>
-                <strong>Staff stream</strong>
-              </div>
-              <div className="feed">
-                {lines.filter((l) => l.role === "staff").length === 0 && (
-                  <div className="small">Staff replies & translations.</div>
+          )}
+
+          {/* Unified conversation timeline */}
+          <div className="small" style={{ marginBottom: "0.35rem" }}>
+            <strong>Conversation</strong>
+          </div>
+          <div className="feed" ref={feedRef}>
+            {lines.length === 0 && (
+              <div className="small">Start a session and speak or type to begin the conversation.</div>
+            )}
+            {lines.map((l, i) => (
+              <div key={i} className={`bubble ${l.role}`}>
+                <div className="who">
+                  <span className="mono">{l.role === "customer" ? "Customer" : "Staff"}</span>
+                  <span className="mono">{l.source_lang}</span>
+                </div>
+                {l.role === "customer" && typeof l.confidence === "number" && (
+                  <div className="confidence-bar" title={`ASR confidence ~ ${l.confidence}`}>
+                    <i style={{ width: `${Math.round(l.confidence * 100)}%` }} />
+                  </div>
                 )}
-                {lines
-                  .map((l, i) => ({ l, i }))
-                  .filter(({ l }) => l.role === "staff")
-                  .map(({ l, i }) => (
-                    <div key={i} className="bubble staff">
-                      <div className="who">
-                        <span className="mono">Staff</span>
-                        <span className="mono">{l.source_lang}</span>
-                      </div>
-                      <div className="small" style={{ marginBottom: "0.35rem" }}>
-                        <strong>Original:</strong> {displayText(l.text_original)}
-                      </div>
-                      <div className="small">
-                        <strong>Customer language:</strong> {displayText(l.text_translated)}
-                      </div>
-                    </div>
-                  ))}
+                {l.low_confidence && <div className="small risk-med">Low confidence — consider repeating.</div>}
+                <div className="small" style={{ marginBottom: "0.2rem" }}>
+                  <strong>Original:</strong> {displayText(l.text_original)}
+                </div>
+                <div className="small">
+                  <strong>{l.role === "customer" ? "Staff view" : "Customer language"}:</strong> {displayText(l.text_translated)}
+                </div>
+                {!!l.normalized?.hints?.length && (
+                  <div className="small" style={{ marginTop: "0.25rem" }}>
+                    <strong>Hints:</strong> {l.normalized.hints.join(" · ")}
+                  </div>
+                )}
+                {!!l.glossary?.length && (
+                  <div style={{ marginTop: "0.35rem" }}>
+                    {l.glossary.map((g) => (
+                      <span key={g.term} className="tag" title={g.definition}>
+                        {g.term}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                {!!l.risk_flags?.length && (
+                  <div style={{ marginTop: "0.35rem" }}>
+                    {l.risk_flags.map((r, j) => (
+                      <span
+                        key={j}
+                        className={`tag ${
+                          r.level === "high" ? "risk-high" : r.level === "medium" ? "risk-med" : "risk-low"
+                        }`}
+                      >
+                        {r.reason}
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
-            </div>
+            ))}
           </div>
 
+          {/* Staff response area */}
           <div style={{ marginTop: "0.85rem" }}>
-            <h2 style={{ marginTop: 0 }}>Staff → customer (translate + TTS, barge-in on re-listen)</h2>
-            <textarea value={staffText} onChange={(e) => setStaffText(e.target.value)} />
+            <h2 style={{ marginTop: 0 }}>Staff → Customer</h2>
+            <textarea value={staffText} onChange={(e) => onStaffTextChange(e.target.value)} />
+            {staffTranslationPreview && (
+              <div className="partial-box" style={{ marginTop: "0.35rem", marginBottom: 0 }}>
+                <strong>Preview in customer language:</strong>{" "}
+                <span className="mono">{staffTranslationPreview}</span>
+              </div>
+            )}
             <div className="row" style={{ marginTop: "0.5rem" }}>
               <button type="button" onClick={staffSpeak} disabled={!connected}>
-                Speak in customer language
+                Translate + Speak
               </button>
-              <span className="small">Starting listening stops TTS playback (barge-in).</span>
+              <span className="small">Translates and plays TTS in customer's language. Listening stops playback.</span>
             </div>
           </div>
         </section>
@@ -1009,6 +1077,30 @@ export default function App() {
           </section>
         </aside>
       </div>
+
+      {/* Toast notifications */}
+      {toasts.length > 0 && (
+        <div style={{
+          position: "fixed",
+          bottom: "1rem",
+          right: "1rem",
+          zIndex: 9999,
+          display: "flex",
+          flexDirection: "column",
+          gap: "0.4rem",
+          maxWidth: "340px",
+        }}>
+          {toasts.map((t) => (
+            <div
+              key={t.id}
+              className={`toast toast-${t.type}`}
+              onClick={() => setToasts((prev) => prev.filter((x) => x.id !== t.id))}
+            >
+              {t.msg}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
