@@ -1,11 +1,14 @@
-"""Low-latency translation for live partial captions.
+"""Low-latency translation for live captions.
 
-Strategy:
-  1. Try Bhashini text translation (NMT, ~300-800ms) — same quality model as the final pipeline.
-  2. Fall back to the configured LLM (Groq for sub-second latency on llama-3.x) with a tight prompt.
-  3. If neither is configured, return the source text unchanged (caller can mark it as untranslated).
+Strategy (first hit wins):
+  1. Bhashini ULCA NMT — when credentials are configured (production path).
+  2. MyMemory public translation API — no key required, generous free tier,
+     covers all Indic↔English pairs we need.
+  3. Configured LLM (Groq for sub-second latency on llama-3.x) — last resort
+     when MyMemory throttles or errors.
+  4. Offline demo phrasebook — guarantees the demo never goes silent.
 
-Includes a small per-(source,target) cache so repeated partials of the same prefix don't re-call.
+Includes a small per-(source,target) cache so repeated partials don't re-call.
 """
 from __future__ import annotations
 
@@ -15,10 +18,12 @@ import logging
 import time
 from typing import Optional
 
+import httpx
 from openai import AsyncOpenAI
 
 from app.config import get_settings
 from app.services.bhashini_client import BhashiniError, bhashini
+from app.services.demo_oracle import demo_translate
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +50,42 @@ def _cache_put(key: tuple[str, str, str], value: str) -> None:
         oldest = min(_cache.items(), key=lambda kv: kv[1][1])[0]
         _cache.pop(oldest, None)
     _cache[key] = (value, time.time())
+
+
+async def _mymemory_translate(text: str, source_lang: str, target_lang: str) -> str:
+    """Public free translation API — no auth required.
+
+    Quota is 5000 chars/day/IP (50k with a contact email). For a branch desk
+    demo this is essentially unlimited. Returns empty string on error so the
+    caller can fall back to the next layer.
+    """
+    if not text:
+        return ""
+    pair = f"{source_lang}|{target_lang}"
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            r = await client.get(
+                "https://api.mymemory.translated.net/get",
+                params={"q": text, "langpair": pair},
+            )
+            if r.status_code >= 400:
+                return ""
+            data = r.json()
+        if int(data.get("responseStatus", 0)) != 200:
+            return ""
+        translated = (data.get("responseData") or {}).get("translatedText") or ""
+        translated = translated.strip()
+        # MyMemory occasionally echoes the source verbatim when it can't
+        # translate — treat that as a miss.
+        if not translated or translated.strip().lower() == text.strip().lower():
+            return ""
+        # Some responses prepend "MYMEMORY WARNING" — drop those.
+        if translated.upper().startswith("MYMEMORY WARNING"):
+            return ""
+        return translated
+    except Exception as e:  # noqa: BLE001
+        logger.info("MyMemory translate failed: %s", e)
+        return ""
 
 
 async def _llm_translate(text: str, source_lang: str, target_lang: str) -> str:
@@ -111,8 +152,7 @@ async def fast_translate(text: str, source_lang: str, target_lang: str) -> tuple
     s = get_settings()
     has_bhashini = bool(s.bhashini_user_id and s.bhashini_ulca_api_key)
 
-    # Try Bhashini first when configured — it's the same model the final result uses,
-    # so the live caption matches the final translation more closely.
+    # 1. Bhashini first when configured (matches the production pipeline).
     if has_bhashini:
         try:
             translated = await asyncio.wait_for(
@@ -125,10 +165,22 @@ async def fast_translate(text: str, source_lang: str, target_lang: str) -> tuple
         except (BhashiniError, asyncio.TimeoutError) as e:
             logger.info("fast_translate: Bhashini fallback (%s)", e)
 
-    # Fallback: LLM (Groq is the typical fast path here).
+    # 2. MyMemory public API — real translation, no key needed.
+    translated = await _mymemory_translate(text, source_lang, target_lang)
+    if translated and translated != text:
+        _cache_put(key, translated)
+        return translated, "mymemory"
+
+    # 3. Configured LLM (Groq / OpenAI-compatible).
     translated = await _llm_translate(text, source_lang, target_lang)
     if translated and translated != text:
         _cache_put(key, translated)
         return translated, "llm"
+
+    # 4. Offline phrasebook — guarantees demo never goes silent.
+    demo = demo_translate(text, source_lang, target_lang)
+    if demo and demo != text:
+        _cache_put(key, demo)
+        return demo, "demo"
 
     return text, "noop"

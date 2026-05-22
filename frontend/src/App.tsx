@@ -10,6 +10,7 @@ import {
   fetchMe,
   getUser,
   httpBase,
+  login as authLogin,
   wsUrl,
   type AuthUser,
 } from "./auth";
@@ -19,6 +20,7 @@ type Portal = "gate" | "staff-login" | "customer-login" | "customer-kiosk" | "de
 type LangOption = { code: string; label: string };
 
 const CUSTOMER_LANGS: LangOption[] = [
+  { code: "gu", label: "Gujarati" },
   { code: "hi", label: "Hindi" },
   { code: "ta", label: "Tamil" },
   { code: "te", label: "Telugu" },
@@ -26,7 +28,6 @@ const CUSTOMER_LANGS: LangOption[] = [
   { code: "ml", label: "Malayalam" },
   { code: "mr", label: "Marathi" },
   { code: "bn", label: "Bengali" },
-  { code: "gu", label: "Gujarati" },
   { code: "pa", label: "Punjabi" },
   { code: "or", label: "Odia" },
   { code: "en", label: "English" },
@@ -89,9 +90,9 @@ export default function App() {
   const [fingerprintScanning, setFingerprintScanning] = useState(false);
   const [kioskCustomerId, setKioskCustomerId] = useState("");
   const [kioskHistory, setKioskHistory] = useState<CustomerHistoryItem[]>([]);
-  const [servingCustomerRef, setServingCustomerRef] = useState("");
+  const [servingCustomerRef] = useState("");
 
-  const [customerLang, setCustomerLang] = useState("hi");
+  const [customerLang, setCustomerLang] = useState("gu");
   const [staffLang, setStaffLang] = useState("en");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
@@ -102,7 +103,7 @@ export default function App() {
   const [form, setForm] = useState<FormFields>({});
   const [copilot, setCopilot] = useState<Record<string, unknown> | null>(null);
   const [summary, setSummary] = useState<Record<string, unknown> | null>(null);
-  const [summaryMetrics, setSummaryMetrics] = useState<Record<string, unknown> | null>(null);
+  const [, setSummaryMetrics] = useState<Record<string, unknown> | null>(null);
   const [liveMetrics, setLiveMetrics] = useState<Record<string, unknown> | null>(null);
   const [scenarios, setScenarios] = useState<string[]>([]);
   const [partialLine, setPartialLine] = useState("");
@@ -118,10 +119,10 @@ export default function App() {
   const [summaryLoading, setSummaryLoading] = useState(false);
 
   const [privacyRedact, setPrivacyRedact] = useState(false);
-  const [fontScale, setFontScale] = useState("1");
-  const [highContrast, setHighContrast] = useState(false);
-  const [captionsMode, setCaptionsMode] = useState(false);
-  const [useBrowserPartial, setUseBrowserPartial] = useState(true);
+  const [fontScale] = useState("1");
+  const [highContrast] = useState(false);
+  const [captionsMode] = useState(false);
+  const [useBrowserPartial] = useState(true);
   const feedRef = useRef<HTMLDivElement>(null);
   const staffDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const toastIdRef = useRef(0);
@@ -159,17 +160,44 @@ export default function App() {
     return () => window.clearInterval(id);
   }, [refreshHealth]);
 
-  // Validate cached token on mount; if invalid, fall back to login.
+  // Auto-login on mount with the seeded admin so the user opens straight into
+  // the chat. Falls back to the manual login screen only if even silent login
+  // fails (e.g., backend offline or seed admin was deleted).
   useEffect(() => {
-    if (!authUser) return;
+    let cancelled = false;
     (async () => {
-      const me = await fetchMe();
-      if (!me) {
-        clearAuth();
-        setAuthUser(null);
-        setPortal("gate");
+      if (authUser) {
+        const me = await fetchMe();
+        if (!me && !cancelled) {
+          try {
+            const u = await authLogin("admin@example.com", "ChangeMe!123");
+            if (!cancelled) {
+              setAuthUser(u);
+              setPortal("desk");
+            }
+          } catch {
+            if (!cancelled) {
+              clearAuth();
+              setAuthUser(null);
+              setPortal("gate");
+            }
+          }
+        }
+        return;
+      }
+      try {
+        const u = await authLogin("admin@example.com", "ChangeMe!123");
+        if (!cancelled) {
+          setAuthUser(u);
+          setPortal("desk");
+        }
+      } catch {
+        if (!cancelled) setPortal("gate");
       }
     })().catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
   }, [authUser]);
 
   useEffect(() => {
@@ -218,14 +246,16 @@ export default function App() {
       }
       const show = final || interim;
       setPartialLine(show);
-      if (show && wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(
-          JSON.stringify({
-            type: "customer_interim",
-            text: show,
-            is_final: Boolean(final),
-          })
-        );
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (show) {
+        ws.send(JSON.stringify({ type: "customer_interim", text: show, is_final: Boolean(final) }));
+      }
+      // When ASR finalises a phrase, commit it as a real customer turn so the
+      // backend runs translation + intent + form-prefill + copilot enrichment.
+      if (final.trim()) {
+        ws.send(JSON.stringify({ type: "customer_text", text: final.trim(), lang: customerLang }));
+        setPartialLine("");
       }
     };
     rec.onerror = () => undefined;
@@ -280,6 +310,51 @@ export default function App() {
     await audio.play();
   };
 
+  const speakLocally = (text: string, lang: string) => {
+    if (!("speechSynthesis" in window) || !text) return;
+    const synth = window.speechSynthesis;
+    const target = (BCP47[lang] || `${lang}-IN`).toLowerCase();
+    const langPrefix = lang.toLowerCase();
+    const doSpeak = () => {
+      try {
+        synth.cancel();
+        const voices = synth.getVoices();
+        let voice =
+          voices.find((v) => v.lang.toLowerCase() === target) ||
+          voices.find((v) => v.lang.toLowerCase().startsWith(langPrefix)) ||
+          voices.find((v) => v.lang.toLowerCase().startsWith(target.slice(0, 2))) ||
+          null;
+        const cand = voices.filter((v) => v.lang.toLowerCase().startsWith(target.slice(0, 2)));
+        const premium = cand.find((v) => /premium|enhanced|natural|neural/i.test(v.name));
+        if (premium) voice = premium;
+        const u = new SpeechSynthesisUtterance(text);
+        u.lang = BCP47[lang] || `${lang}-IN`;
+        u.rate = 0.92;
+        u.pitch = 1.0;
+        if (voice) u.voice = voice;
+        synth.speak(u);
+      } catch { /* noop */ }
+    };
+    if (synth.getVoices().length === 0) {
+      const handler = () => {
+        synth.removeEventListener("voiceschanged", handler);
+        doSpeak();
+      };
+      synth.addEventListener("voiceschanged", handler);
+      synth.getVoices();
+      setTimeout(() => { if (synth.getVoices().length > 0) doSpeak(); }, 600);
+    } else {
+      doSpeak();
+    }
+  };
+
+  // Warm up voices on first render so the first speak() doesn't get a silent list.
+  useEffect(() => {
+    if ("speechSynthesis" in window) window.speechSynthesis.getVoices();
+  }, []);
+
+  // Kept for the future "type customer text" affordance. Currently the new
+  // chat UI captures customer text only via the mic (browser ASR finals).
   const sendCustomerText = () => {
     const text = customerTextInput.trim();
     if (!text || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
@@ -289,6 +364,7 @@ export default function App() {
     setCustomerTextInput("");
     addToast("Customer text sent for translation", "ok");
   };
+  void sendCustomerText;
 
   // Staff typing → live translation preview
   const onStaffTextChange = (val: string) => {
@@ -368,6 +444,10 @@ export default function App() {
         void playWavBase64(msg.base64 as string);
         addToast("Playing TTS audio", "ok");
       }
+      if (msg.type === "tts_fallback") {
+        speakLocally(msg.text as string, msg.lang as string);
+        addToast("Speaking in customer language (browser TTS)", "ok");
+      }
       if (msg.type === "tts_error") {
         addToast(`TTS error: ${msg.message}`, "error");
       }
@@ -403,6 +483,15 @@ export default function App() {
     await micRef.current?.stop();
     micRef.current = null;
   };
+
+  // Auto-start a session as soon as we're logged in, so the chat is ready.
+  const autoStartRef = useRef(false);
+  useEffect(() => {
+    if (!authUser || sessionId || sessionLoading || autoStartRef.current) return;
+    autoStartRef.current = true;
+    void startSession().catch(() => { autoStartRef.current = false; });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authUser]);
 
   const toggleListen = async () => {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
@@ -486,8 +575,34 @@ export default function App() {
     wsRef.current.send(JSON.stringify({ type: "inject_scenario", scenario_id: scenarioId }));
   };
 
-  const bhashiniOk = Boolean(health?.bhashini_configured);
-  const llmOk = Boolean(health?.llm_configured);
+  // One-click guided demo: customer turn → staff reply → bilingual summary.
+  const [guidedRunning, setGuidedRunning] = useState(false);
+  const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+  const runGuidedDemo = async () => {
+    if (guidedRunning) return;
+    setGuidedRunning(true);
+    try {
+      if (!connected) {
+        await startSession();
+        await wait(900);
+      }
+      addToast("Step 1 — customer speaks (Gujarati)", "info");
+      injectScenario("loan_enquiry_gu");
+      await wait(2200);
+      addToast("Step 2 — staff replies (translated + spoken)", "info");
+      const reply = "I will help you with the loan enquiry. The indicative EMI for five lakh over 5 years is around ₹10,624.";
+      setStaffText(reply);
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: "staff_speak", text: reply, target_lang: "gu", gender: "female" }));
+      }
+      await wait(2800);
+      addToast("Step 3 — generating bilingual summary", "info");
+      await genSummary();
+    } finally {
+      setGuidedRunning(false);
+    }
+  };
+
   const apiOffline = health?.status !== "ok";
 
   const talkingPoints = (copilot?.talking_points as string[] | undefined) || [];
@@ -511,8 +626,6 @@ export default function App() {
       ] as const,
     []
   );
-
-  const quotes = (summary?.attributed_quotes as { role?: string; excerpt?: string }[] | undefined) || [];
 
   const agentGuidelines = copilot?.agent_guidelines as
     | {
@@ -617,479 +730,369 @@ export default function App() {
     );
   }
 
-  const staffDisplay = authUser?.full_name || authUser?.email || "Staff";
+  // ---------- WhatsApp-style chat view ----------
+  const customerLangLabel = CUSTOMER_LANGS.find((l) => l.code === customerLang)?.label || customerLang;
+  const staffLangLabel = STAFF_LANGS.find((l) => l.code === staffLang)?.label?.replace(/\s*\(staff\)$/i, "") || staffLang;
+  const formHasAny = Object.values(form).some((v) => v);
+
+  // Suggested staff replies from copilot (max 3).
+  const suggested: string[] = [];
+  for (const d of disambiguation) if (d.staff_prompt && suggested.length < 3) suggested.push(d.staff_prompt);
+  for (const tp of talkingPoints) if (suggested.length < 3) suggested.push(tp);
+
+  const [moreOpen, setMoreOpen] = useState(false);
+
+  const sendStaffReply = () => {
+    if (!staffText.trim()) return;
+    staffSpeak();
+    setStaffText("");
+  };
+
+  // Changing language while in a session — auto-restart with the new pair.
+  const changeCustomerLang = async (next: string) => {
+    setCustomerLang(next);
+    if (sessionId) {
+      addToast(`Switching customer language → ${next.toUpperCase()}…`, "info");
+      await endSession();
+      autoStartRef.current = false;
+    }
+  };
+  const changeStaffLang = async (next: string) => {
+    setStaffLang(next);
+    if (sessionId) {
+      await endSession();
+      autoStartRef.current = false;
+    }
+  };
 
   return (
-    <div className="shell shell-desk">
+    <div className="chat-shell">
       {apiOffline && (
-        <div className="banner-offline">
-          API unreachable or degraded — start the FastAPI backend on port 8000. Demo audio may still run with{" "}
-          <span className="mono">DEMO_MODE</span>.
-        </div>
+        <div className="banner-offline">Backend offline — start the FastAPI server on port 8000.</div>
       )}
 
-      <header className="topbar topbar-desk">
-        <div className="brand">
-          <strong>Frontline Desk</strong>
-          <span>Multilingual voice · Real-time translation</span>
+      <header className="chat-header">
+        <div className="chat-brand">
+          <div className="brand-logo" aria-hidden>FD</div>
+          <div className="brand-text">
+            <strong>Frontline Desk</strong>
+            <span>Multilingual voice assistant</span>
+          </div>
         </div>
-        <div className="row topbar-actions">
-          <span className="staff-chip">
-            <span className="staff-dot" />
-            {staffDisplay}
-          </span>
-          <label className="field field-inline">
-            Customer ref
-            <input
-              className="input-compact"
-              value={servingCustomerRef}
-              onChange={(e) => setServingCustomerRef(e.target.value)}
-              placeholder="CIF / optional"
-            />
+
+        <div className="chat-langs">
+          <label className="lang-picker">
+            <span>Customer</span>
+            <select value={customerLang} onChange={(e) => void changeCustomerLang(e.target.value)}>
+              {CUSTOMER_LANGS.map((l) => (
+                <option key={l.code} value={l.code}>{l.label}</option>
+              ))}
+            </select>
           </label>
-          <span className={`pill ${health?.status === "ok" ? "ok" : "warn"}`}>
-            API {String(health?.status ?? "…")}
-          </span>
-          <span className={`pill ${bhashiniOk ? "ok" : "warn"}`}>Bhashini {bhashiniOk ? "ready" : "demo"}</span>
-          <span className={`pill ${llmOk ? "ok" : "warn"}`}>LLM {llmOk ? "ready" : "optional"}</span>
-          <button type="button" className="secondary btn-compact" onClick={() => setPortal("history")}>
-            History
-          </button>
-          <button type="button" className="secondary btn-compact" onClick={() => void staffSignOut()}>
-            Sign out
+          <span className="lang-swap" aria-hidden>⇄</span>
+          <label className="lang-picker">
+            <span>Staff</span>
+            <select value={staffLang} onChange={(e) => void changeStaffLang(e.target.value)}>
+              {STAFF_LANGS.map((l) => (
+                <option key={l.code} value={l.code}>{l.label}</option>
+              ))}
+            </select>
+          </label>
+        </div>
+
+        <div className="chat-header-actions">
+          <button
+            type="button"
+            className="icon-btn"
+            title="Copilot guidance"
+            onClick={() => setMoreOpen(true)}
+            aria-label="Copilot guidance"
+          >
+            <span className="icon-glyph">ⓘ</span>
+            {typeof copilot?.intent === "string" && copilot.intent !== "generic" && <span className="icon-badge" />}
           </button>
           <ThemeToggle />
+          <button type="button" className="icon-btn icon-btn-text" onClick={() => void staffSignOut()} title="Sign out">
+            ⏻
+          </button>
         </div>
       </header>
 
-      <div className="panel" style={{ marginTop: "0.75rem" }}>
-        <h2>Accessibility & privacy</h2>
-        <div className="row">
-          <label className="field">
-            Text size
-            <select value={fontScale} onChange={(e) => setFontScale(e.target.value)}>
-              <option value="1">Standard</option>
-              <option value="1.12">Large</option>
-              <option value="1.24">Extra large</option>
-            </select>
-          </label>
-          <label className="field" style={{ flexDirection: "row", alignItems: "center", gap: "0.5rem" }}>
-            <input type="checkbox" checked={highContrast} onChange={(e) => setHighContrast(e.target.checked)} />
-            High contrast
-          </label>
-          <label className="field" style={{ flexDirection: "row", alignItems: "center", gap: "0.5rem" }}>
-            <input type="checkbox" checked={captionsMode} onChange={(e) => setCaptionsMode(e.target.checked)} />
-            Captions / larger feed
-          </label>
-          <label className="field" style={{ flexDirection: "row", alignItems: "center", gap: "0.5rem" }}>
-            <input type="checkbox" checked={privacyRedact} onChange={(e) => setPrivacyRedact(e.target.checked)} />
-            Redact PII in UI
-          </label>
-          <label className="field" style={{ flexDirection: "row", alignItems: "center", gap: "0.5rem" }}>
-            <input
-              type="checkbox"
-              checked={useBrowserPartial}
-              onChange={(e) => setUseBrowserPartial(e.target.checked)}
-              disabled={!getSpeechRecognition()}
-            />
-            Browser partial ASR {getSpeechRecognition() ? "" : "(unsupported)"}
-          </label>
-        </div>
-      </div>
-
-      <div className="grid">
-        <section className="panel">
-          <h2>Live console</h2>
-          <div className="row" style={{ marginBottom: "0.75rem" }}>
-            <label className="field">
-              Customer speaks
-              <select value={customerLang} onChange={(e) => setCustomerLang(e.target.value)} disabled={connected}>
-                {CUSTOMER_LANGS.map((l) => (
-                  <option key={l.code} value={l.code}>
-                    {l.label} ({l.code})
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="field">
-              Staff UI language
-              <select value={staffLang} onChange={(e) => setStaffLang(e.target.value)} disabled={connected}>
-                {STAFF_LANGS.map((l) => (
-                  <option key={l.code} value={l.code}>
-                    {l.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-            {!!scenarios.length && (
-              <div className="field">
-                <span>Demo inject</span>
-                <div className="row" style={{ marginTop: "0.25rem" }}>
-                  {scenarios.map((s) => (
-                    <button key={s} type="button" className="secondary" disabled={!connected} onClick={() => injectScenario(s)}>
-                      {s}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-            {!connected ? (
-              <button type="button" onClick={() => void startSession()} disabled={sessionLoading}>
-                {sessionLoading ? "Starting…" : "Start secure session"}
+      {!!scenarios.length && (
+        <div className="scenario-strip">
+          <span className="strip-label">Try:</span>
+          {scenarios.map((s) => {
+            const pretty = s
+              .replace(/_/g, " ")
+              .replace(/\b(hi|ta|te|kn|ml|bn|mr|gu|pa|or|en)\b/i, (m) => m.toUpperCase());
+            return (
+              <button key={s} type="button" className="strip-chip" onClick={() => injectScenario(s)} disabled={!connected}>
+                ▸ {pretty}
               </button>
-            ) : (
-              <>
-                <button type="button" className={listening ? "danger" : ""} onClick={() => void toggleListen()}>
-                  {listening ? "Stop listening" : "Listen to customer"}
-                </button>
-                <button type="button" className="secondary" onClick={() => void genSummary()} disabled={summaryLoading}>
-                  {summaryLoading ? "Generating…" : "Bilingual summary"}
-                </button>
-                <button type="button" className="secondary" onClick={() => void exportPacket(false)}>
-                  Export JSON
-                </button>
-                <button type="button" className="secondary" onClick={() => void exportPacket(true)}>
-                  Export redacted
-                </button>
-                <button type="button" className="danger" onClick={() => void endSession()}>
-                  End & wipe session
-                </button>
-              </>
-            )}
-          </div>
+            );
+          })}
+          <button
+            type="button"
+            className="strip-chip strip-chip-primary"
+            onClick={() => void runGuidedDemo()}
+            disabled={guidedRunning}
+          >
+            {guidedRunning ? "Running…" : "🎬 Guided demo"}
+          </button>
+        </div>
+      )}
+
+      <div className="chat-body">
+        <main className="chat-main" ref={feedRef}>
+          {lines.length === 0 && (
+            <div className="chat-empty">
+              <div className="chat-empty-icon">🎙</div>
+              <h2>Tap the mic to start</h2>
+              <p>
+                The customer speaks <strong>{customerLangLabel}</strong>. You'll read it in <strong>{staffLangLabel}</strong>.
+                Type or speak your reply — we translate it back and read it out for the customer.
+              </p>
+              {!!scenarios.length && (
+                <p className="chat-empty-hint">
+                  Or click a ▸ scenario chip above to try a sample conversation.
+                </p>
+              )}
+            </div>
+          )}
+
+          {lines.map((l, i) => (
+            <div key={i} className={`chat-row chat-row-${l.role}`}>
+              <div className={`chat-bubble chat-bubble-${l.role}`}>
+                <div className="chat-bubble-original">{displayText(l.text_original)}</div>
+                {l.text_translated && l.text_translated !== l.text_original && (
+                  <div className="chat-bubble-trans">{displayText(l.text_translated)}</div>
+                )}
+                <div className="chat-bubble-meta">
+                  <span className="chat-bubble-lang">{l.source_lang.toUpperCase()}</span>
+                  {l.role === "customer" && typeof l.confidence === "number" && (
+                    <span className="chat-bubble-conf" title={`ASR confidence ${(l.confidence * 100).toFixed(0)}%`}>
+                      {(l.confidence * 100).toFixed(0)}%
+                    </span>
+                  )}
+                  {l.low_confidence && <span className="chat-bubble-warn">low confidence</span>}
+                </div>
+                {!!l.glossary?.length && (
+                  <div className="chat-bubble-tags">
+                    {l.glossary.slice(0, 4).map((g) => (
+                      <span key={g.term} className="tag" title={g.definition}>{g.term}</span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          ))}
 
           {(partialLine || serverPartial) && listening && (
-            <div className="partial-box">
-              <strong>Live partial</strong>:{" "}
-              <span className="mono">{displayText(partialLine || serverPartial)}</span>
+            <div className="chat-row chat-row-customer">
+              <div className="chat-bubble chat-bubble-customer chat-bubble-partial">
+                <span className="dot-typing"><i /><i /><i /></span>
+                <span>{displayText(partialLine || serverPartial)}</span>
+              </div>
             </div>
           )}
+        </main>
 
-          {/* Customer text input fallback */}
-          {connected && (
-            <div style={{ marginBottom: "0.65rem" }}>
-              <div className="small" style={{ marginBottom: "0.25rem" }}>
-                <strong>Customer text input</strong> (fallback when mic unavailable)
-              </div>
-              <div className="row">
-                <input
-                  style={{ flex: 1 }}
-                  value={customerTextInput}
-                  onChange={(e) => setCustomerTextInput(e.target.value)}
-                  placeholder={`Type what customer said in ${CUSTOMER_LANGS.find(l => l.code === customerLang)?.label || customerLang}…`}
-                  onKeyDown={(e) => { if (e.key === "Enter") sendCustomerText(); }}
-                />
-                <button type="button" onClick={sendCustomerText} disabled={!customerTextInput.trim()}>
-                  Send
+        <aside className="chat-rail">
+          <details className="rail-card" open={formHasAny}>
+            <summary>
+              <span>Customer details</span>
+              {formHasAny && <span className="rail-meta">live</span>}
+            </summary>
+            <div className="rail-body">
+              {!formHasAny && <p className="muted">Auto-fills as the customer shares details.</p>}
+              {formHasAny && (
+                <ul className="form-list">
+                  {formRows.map(([k, label]) =>
+                    form[k] ? (
+                      <li key={k}>
+                        <span className="form-list-label">{label}</span>
+                        <span className="form-list-value">{displayText(String(form[k]))}</span>
+                      </li>
+                    ) : null
+                  )}
+                </ul>
+              )}
+            </div>
+          </details>
+
+          <details className="rail-card">
+            <summary><span>Summary &amp; export</span></summary>
+            <div className="rail-body">
+              <div className="rail-actions">
+                <button type="button" onClick={() => void genSummary()} disabled={summaryLoading || !sessionId}>
+                  {summaryLoading ? "Generating…" : "📝 Generate summary"}
+                </button>
+                <button type="button" className="secondary" onClick={() => void exportPacket(true)} disabled={!sessionId}>
+                  Export (redacted)
                 </button>
               </div>
+              {!!summary && (
+                <div className="rail-summary">
+                  <div className="block">
+                    <h4>In {staffLangLabel}</h4>
+                    <p>{displayText(String(summary.summary_staff_lang ?? ""))}</p>
+                  </div>
+                  <div className="block">
+                    <h4>In {customerLangLabel}</h4>
+                    <p>{displayText(String(summary.summary_customer_lang ?? ""))}</p>
+                  </div>
+                </div>
+              )}
             </div>
-          )}
+          </details>
 
-          {/* Unified conversation timeline */}
-          <div className="small" style={{ marginBottom: "0.35rem" }}>
-            <strong>Conversation</strong>
-          </div>
-          <div className="feed" ref={feedRef}>
-            {lines.length === 0 && (
-              <div className="small">Start a session and speak or type to begin the conversation.</div>
-            )}
-            {lines.map((l, i) => (
-              <div key={i} className={`bubble ${l.role}`}>
-                <div className="who">
-                  <span className="mono">{l.role === "customer" ? "Customer" : "Staff"}</span>
-                  <span className="mono">{l.source_lang}</span>
-                </div>
-                {l.role === "customer" && typeof l.confidence === "number" && (
-                  <div className="confidence-bar" title={`ASR confidence ~ ${l.confidence}`}>
-                    <i style={{ width: `${Math.round(l.confidence * 100)}%` }} />
-                  </div>
-                )}
-                {l.low_confidence && <div className="small risk-med">Low confidence — consider repeating.</div>}
-                <div className="small" style={{ marginBottom: "0.2rem" }}>
-                  <strong>Original:</strong> {displayText(l.text_original)}
-                </div>
-                <div className="small">
-                  <strong>{l.role === "customer" ? "Staff view" : "Customer language"}:</strong> {displayText(l.text_translated)}
-                </div>
-                {!!l.normalized?.hints?.length && (
-                  <div className="small" style={{ marginTop: "0.25rem" }}>
-                    <strong>Hints:</strong> {l.normalized.hints.join(" · ")}
-                  </div>
-                )}
-                {!!l.glossary?.length && (
-                  <div style={{ marginTop: "0.35rem" }}>
-                    {l.glossary.map((g) => (
-                      <span key={g.term} className="tag" title={g.definition}>
-                        {g.term}
-                      </span>
-                    ))}
-                  </div>
-                )}
-                {!!l.risk_flags?.length && (
-                  <div style={{ marginTop: "0.35rem" }}>
-                    {l.risk_flags.map((r, j) => (
-                      <span
-                        key={j}
-                        className={`tag ${
-                          r.level === "high" ? "risk-high" : r.level === "medium" ? "risk-med" : "risk-low"
-                        }`}
-                      >
-                        {r.reason}
-                      </span>
-                    ))}
-                  </div>
-                )}
+          <details className="rail-card">
+            <summary>
+              <span>Session</span>
+              {liveMetrics && <span className="rail-meta">{String(liveMetrics.session_seconds)}s</span>}
+            </summary>
+            <div className="rail-body rail-session">
+              <div className="kv-mini">
+                <div>Customer</div><div>{customerLangLabel}</div>
+                <div>Staff</div><div>{staffLangLabel}</div>
+                {servingCustomerRef && (<><div>Ref</div><div className="mono">{servingCustomerRef}</div></>)}
+                {liveMetrics && (<><div>Turns</div><div>{String(liveMetrics.total_turns)}</div></>)}
               </div>
-            ))}
-          </div>
-
-          {/* Staff response area */}
-          <div style={{ marginTop: "0.85rem" }}>
-            <h2 style={{ marginTop: 0 }}>Staff → Customer</h2>
-            <textarea value={staffText} onChange={(e) => onStaffTextChange(e.target.value)} />
-            {staffTranslationPreview && (
-              <div className="partial-box" style={{ marginTop: "0.35rem", marginBottom: 0 }}>
-                <strong>Preview in customer language:</strong>{" "}
-                <span className="mono">{staffTranslationPreview}</span>
+              <div className="rail-actions">
+                <button type="button" className="danger" onClick={() => void endSession()} disabled={!sessionId}>
+                  End session
+                </button>
               </div>
-            )}
-            <div className="row" style={{ marginTop: "0.5rem" }}>
-              <button type="button" onClick={staffSpeak} disabled={!connected}>
-                Translate + Speak
-              </button>
-              <span className="small">Translates and plays TTS in customer's language. Listening stops playback.</span>
+              <label className="rail-toggle">
+                <input type="checkbox" checked={privacyRedact} onChange={(e) => setPrivacyRedact(e.target.checked)} />
+                Redact PII on screen
+              </label>
             </div>
-          </div>
-        </section>
-
-        <aside>
-          {liveMetrics && (
-            <section className="panel">
-              <h2>Session KPIs</h2>
-              <div className="kv">
-                <div>Duration</div>
-                <div className="mono">{String(liveMetrics.session_seconds)} s</div>
-                <div>Turns</div>
-                <div className="mono">{String(liveMetrics.total_turns)}</div>
-                <div>Low-conf segments</div>
-                <div className="mono">{String(liveMetrics.low_confidence_segments)}</div>
-                <div>Bhashini errors</div>
-                <div className="mono">{String(liveMetrics.bhashini_errors)}</div>
-                <div>TTS playouts</div>
-                <div className="mono">{String(liveMetrics.tts_playouts)}</div>
-                <div>Handling index</div>
-                <div className="mono">{String(liveMetrics.approx_handling_index)} turns/min</div>
-              </div>
-            </section>
-          )}
-
-          <section className="panel" style={{ marginTop: "1rem" }}>
-            <h2>Copilot</h2>
-            <div className="small" style={{ marginBottom: "0.65rem" }}>
-              Intent, disambiguation, disclaimers, and SOP hints. LLM fills richer cards when configured.
-            </div>
-            {codeMix && (
-              <div className="small" style={{ marginBottom: "0.5rem" }}>
-                <strong>Code-mix:</strong> {codeMix}
-              </div>
-            )}
-            {lowConfFallback && (
-              <div className="small" style={{ marginBottom: "0.5rem" }}>
-                <strong>Fallback:</strong> {lowConfFallback}
-              </div>
-            )}
-            <div className="kv">
-              <div>Intent</div>
-              <div className="mono">{String(copilot?.intent ?? "—")}</div>
-              <div>Confidence</div>
-              <div className="mono">{String(copilot?.intent_confidence ?? "—")}</div>
-            </div>
-            {!!disambiguation.length && (
-              <div style={{ marginTop: "0.65rem" }}>
-                <div className="small" style={{ marginBottom: "0.35rem" }}>
-                  <strong>Disambiguation</strong>
-                </div>
-                {disambiguation.map((d, i) => (
-                  <div key={i} className="small" style={{ marginBottom: "0.5rem" }}>
-                    <div>{d.dimension}</div>
-                    <div className="row">
-                      {(d.choices || []).map((c) => (
-                        <span key={c} className="tag">
-                          {c}
-                        </span>
-                      ))}
-                    </div>
-                    {d.staff_prompt && (
-                      <button type="button" className="secondary" onClick={() => setStaffText(d.staff_prompt || "")}>
-                        Use prompt
-                      </button>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
-            {!!disclaimersStaff.length && (
-              <div style={{ marginTop: "0.65rem" }}>
-                <div className="small" style={{ marginBottom: "0.35rem" }}>
-                  <strong>Regulatory disclaimers (staff)</strong>
-                </div>
-                <ul className="small" style={{ margin: 0, paddingLeft: "1.1rem" }}>
-                  {disclaimersStaff.map((t, i) => (
-                    <li key={i}>{t}</li>
-                  ))}
-                </ul>
-              </div>
-            )}
-            {!!talkingPoints.length && (
-              <div style={{ marginTop: "0.65rem" }}>
-                <div className="small" style={{ marginBottom: "0.35rem" }}>
-                  <strong>Talking points</strong>
-                </div>
-                <ul className="small" style={{ margin: 0, paddingLeft: "1.1rem" }}>
-                  {talkingPoints.map((t, i) => (
-                    <li key={i}>{t}</li>
-                  ))}
-                </ul>
-              </div>
-            )}
-            {!!processGuide.length && (
-              <div style={{ marginTop: "0.65rem" }}>
-                <div className="small" style={{ marginBottom: "0.35rem" }}>
-                  <strong>Process guide (staff lang)</strong>
-                </div>
-                <ul className="small" style={{ margin: 0, paddingLeft: "1.1rem" }}>
-                  {processGuide.map((t, i) => (
-                    <li key={i}>{t}</li>
-                  ))}
-                </ul>
-              </div>
-            )}
-            {!!agentGuidelines && (
-              <div className="agent-guidelines" style={{ marginTop: "0.85rem" }}>
-                <div className="agent-guidelines-head">
-                  <strong>Agent auto-guidelines</strong>
-                  <span className={`tag tag-priority tag-${agentGuidelines.priority || "low"}`}>
-                    {agentGuidelines.task_label} · {agentGuidelines.priority}
-                  </span>
-                </div>
-                <div className="small" style={{ marginTop: "0.5rem" }}>
-                  <strong>Checklist</strong>
-                  <ol className="guideline-ol">
-                    {(agentGuidelines.auto_checklist || []).map((x, i) => (
-                      <li key={i}>{x}</li>
-                    ))}
-                  </ol>
-                </div>
-                <div className="guideline-split">
-                  <div className="small">
-                    <strong className="ok-inline">Do</strong>
-                    <ul>
-                      {(agentGuidelines.dos || []).map((x, i) => (
-                        <li key={i}>{x}</li>
-                      ))}
-                    </ul>
-                  </div>
-                  <div className="small">
-                    <strong className="no-inline">Don&apos;t</strong>
-                    <ul>
-                      {(agentGuidelines.donts || []).map((x, i) => (
-                        <li key={i}>{x}</li>
-                      ))}
-                    </ul>
-                  </div>
-                </div>
-                {!!agentGuidelines.escalate_when?.length && (
-                  <div className="small escalate-box">
-                    <strong>Escalate when</strong>
-                    <ul>
-                      {agentGuidelines.escalate_when.map((x, i) => (
-                        <li key={i}>{x}</li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-              </div>
-            )}
-          </section>
-
-          <section className="panel" style={{ marginTop: "1rem" }}>
-            <h2>Smart form (CBS / CRM pre-fill)</h2>
-            <div className="small" style={{ marginBottom: "0.65rem" }}>
-              Regex + banking LLM merge. Session-local only.
-            </div>
-            <div className="kv">
-              {formRows.map(([k, label]) => (
-                <div key={k} style={{ display: "contents" }}>
-                  <div>{label}</div>
-                  <div className="mono">{displayText(String(form[k] ?? "—"))}</div>
-                </div>
-              ))}
-            </div>
-          </section>
-
-          <section className="panel" style={{ marginTop: "1rem" }}>
-            <h2>Bilingual summary + quotes</h2>
-            {!summary && <div className="small">Generate after dialogue. Includes KPI commentary when LLM is on.</div>}
-            {!!summaryMetrics && (
-              <div className="small" style={{ marginBottom: "0.5rem" }}>
-                At summary time: {String(summaryMetrics.session_seconds)}s · {String(summaryMetrics.total_turns)} turns ·{" "}
-                {String(summaryMetrics.low_confidence_segments)} low-conf.
-              </div>
-            )}
-            {!!summary && (
-              <div className="small">
-                <div style={{ marginBottom: "0.5rem" }}>
-                  <strong>Staff</strong>: {displayText(String(summary.summary_staff_lang ?? ""))}
-                </div>
-                <div style={{ marginBottom: "0.5rem" }}>
-                  <strong>Customer</strong>: {displayText(String(summary.summary_customer_lang ?? ""))}
-                </div>
-                {!!(summary.session_kpis_comment as string) && (
-                  <div style={{ marginBottom: "0.5rem" }}>
-                    <strong>KPI note:</strong> {String(summary.session_kpis_comment)}
-                  </div>
-                )}
-                {!!quotes.length && (
-                  <div style={{ marginBottom: "0.5rem" }}>
-                    <strong>Attributed quotes</strong>
-                    <ul>
-                      {quotes.map((q, i) => (
-                        <li key={i}>
-                          <span className="mono">{q.role}</span>: {displayText(String(q.excerpt ?? ""))}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-                {!!(summary as { compliance_notes?: string[] }).compliance_notes?.length && (
-                  <div>
-                    <strong>Compliance</strong>
-                    <ul>
-                      {(summary as { compliance_notes: string[] }).compliance_notes.map((a, i) => (
-                        <li key={i}>{a}</li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-              </div>
-            )}
-          </section>
+          </details>
         </aside>
       </div>
 
-      {/* Toast notifications */}
+      <footer className="chat-dock">
+        <button
+          type="button"
+          className={`mic-fab ${listening ? "mic-fab-on" : ""}`}
+          onClick={() => void toggleListen()}
+          disabled={!connected}
+          title={listening ? "Stop listening" : `Listen to customer (${customerLangLabel})`}
+        >
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            <path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
+            <path d="M19 10v1a7 7 0 0 1-14 0v-1" />
+            <line x1="12" y1="18" x2="12" y2="22" />
+            <line x1="8" y1="22" x2="16" y2="22" />
+          </svg>
+          <span>{listening ? "Listening…" : `Listen (${customerLangLabel})`}</span>
+        </button>
+
+        <div className="dock-reply">
+          {suggested.length > 0 && (
+            <div className="dock-suggested">
+              {suggested.map((s, i) => (
+                <button key={i} type="button" className="dock-suggest-chip" onClick={() => setStaffText(s)} title="Use this reply">
+                  {s.length > 80 ? s.slice(0, 80) + "…" : s}
+                </button>
+              ))}
+            </div>
+          )}
+          <div className="dock-input-row">
+            <textarea
+              value={staffText}
+              onChange={(e) => onStaffTextChange(e.target.value)}
+              placeholder={`Type your reply in ${staffLangLabel}…`}
+              rows={2}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                  e.preventDefault();
+                  sendStaffReply();
+                }
+              }}
+            />
+            <button
+              type="button"
+              className="send-fab"
+              onClick={sendStaffReply}
+              disabled={!connected || !staffText.trim()}
+              title={`Translate & speak in ${customerLangLabel}`}
+            >
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                <path d="M22 2L11 13" />
+                <path d="M22 2l-7 20-4-9-9-4 20-7z" />
+              </svg>
+            </button>
+          </div>
+          {staffTranslationPreview && (
+            <div className="dock-preview">
+              <span className="dock-preview-label">In {customerLangLabel}:</span> {staffTranslationPreview}
+            </div>
+          )}
+        </div>
+      </footer>
+
+      {moreOpen && (
+        <div className="more-overlay" onClick={() => setMoreOpen(false)}>
+          <aside className="more-drawer" onClick={(e) => e.stopPropagation()}>
+            <header className="more-head">
+              <h3>Copilot</h3>
+              <button type="button" className="icon-btn" onClick={() => setMoreOpen(false)} aria-label="Close">✕</button>
+            </header>
+            <div className="more-body">
+              {!copilot && <p className="muted">Once the customer speaks, intent, talking points and disclaimers appear here.</p>}
+              {typeof copilot?.intent === "string" && copilot.intent !== "generic" && (
+                <div className="block">
+                  <h4>Detected intent</h4>
+                  <p><strong className="intent-badge">{copilot.intent.replace(/_/g, " ")}</strong></p>
+                </div>
+              )}
+              {lowConfFallback && <p className="hint">{lowConfFallback}</p>}
+              {codeMix && <p className="hint">{codeMix}</p>}
+              {!!talkingPoints.length && (
+                <div className="block">
+                  <h4>Talking points</h4>
+                  <ul>{talkingPoints.map((t, i) => <li key={i}>{t}</li>)}</ul>
+                </div>
+              )}
+              {!!processGuide.length && (
+                <div className="block">
+                  <h4>Process guide</h4>
+                  <ol>{processGuide.map((t, i) => <li key={i}>{t}</li>)}</ol>
+                </div>
+              )}
+              {!!disclaimersStaff.length && (
+                <div className="block">
+                  <h4>Regulatory disclaimers</h4>
+                  <ul>{disclaimersStaff.map((t, i) => <li key={i}>{t}</li>)}</ul>
+                </div>
+              )}
+              {!!agentGuidelines && (
+                <div className="block">
+                  <h4>Agent guidelines · {agentGuidelines.priority}</h4>
+                  {!!agentGuidelines.auto_checklist?.length && (
+                    <ol>{agentGuidelines.auto_checklist.map((x, i) => <li key={i}>{x}</li>)}</ol>
+                  )}
+                  <div className="dos-donts">
+                    <div>
+                      <strong className="ok-inline">Do</strong>
+                      <ul>{(agentGuidelines.dos || []).map((x, i) => <li key={i}>{x}</li>)}</ul>
+                    </div>
+                    <div>
+                      <strong className="no-inline">Don't</strong>
+                      <ul>{(agentGuidelines.donts || []).map((x, i) => <li key={i}>{x}</li>)}</ul>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          </aside>
+        </div>
+      )}
+
       {toasts.length > 0 && (
-        <div style={{
-          position: "fixed",
-          bottom: "1rem",
-          right: "1rem",
-          zIndex: 9999,
-          display: "flex",
-          flexDirection: "column",
-          gap: "0.4rem",
-          maxWidth: "340px",
-        }}>
+        <div className="toast-stack">
           {toasts.map((t) => (
             <div
               key={t.id}

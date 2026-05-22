@@ -9,6 +9,11 @@ from openai import AsyncOpenAI
 
 from app.config import get_settings
 from app.services.banking_finetune_prompts import BANKING_JSON_FEW_SHOTS
+from app.services.demo_oracle import (
+    demo_enrich,
+    demo_form_extract,
+    demo_summary,
+)
 from app.services.safety import sanitize_for_llm
 
 logger = logging.getLogger(__name__)
@@ -138,6 +143,17 @@ Recent conversation context:
 {recent_context}
 """
     data = await banking_json_completion(user_prompt=prompt, schema_hint=schema)
+    if not data:
+        # No LLM configured — fall back to the offline demo oracle so the
+        # copilot panel still populates with intent / talking points / risks.
+        staff_lang = "en"  # enrich_turn only knows staff text in english here
+        data = demo_enrich(
+            customer_text=transcript_customer_lang,
+            asr_confidence=asr_confidence,
+            staff_lang=staff_lang,
+            customer_lang="hi",
+        )
+        data["_engine"] = "demo_oracle"
     if asr_confidence < 0.5 and not data.get("low_confidence_fallback"):
         data["low_confidence_fallback"] = (
             "Confidence is low — please ask the customer to repeat once, a little slower, in their preferred language."
@@ -167,6 +183,10 @@ Use null when unknown. For Aadhaar never echo full number."""
     llm = await banking_json_completion(user_prompt=prompt, schema_hint=schema)
     merged.update({k: v for k, v in llm.items() if v not in (None, "", [])})
     merged.update(heuristic_extract(conversation_snippet))
+    # Demo oracle catches name / address patterns the LLM is offline for.
+    for k, v in demo_form_extract(conversation_snippet).items():
+        if v and not merged.get(k):
+            merged[k] = v
     return merged
 
 
@@ -199,13 +219,10 @@ async def bilingual_summary(
     data = await banking_json_completion(user_prompt=prompt, schema_hint=schema)
     if data:
         return data
-    return {
-        "summary_staff_lang": "LLM not configured — enable LLM_API_KEY for generated summaries.",
-        "summary_customer_lang": "सारांश उत्पन्न करने के लिए LLM कॉन्फ़िगर करें।",
-        "action_items": [],
-        "products_discussed": [],
-        "open_questions": [],
-        "compliance_notes": ["No institutional memory: session-only capture."],
-        "attributed_quotes": [],
-        "session_kpis_comment": "Enable LLM for KPI commentary.",
-    }
+    # No LLM — build a plausible bilingual summary from the turns themselves.
+    return demo_summary(
+        turns=turns,
+        customer_lang=customer_lang,
+        staff_lang=staff_lang,
+        metrics=metrics,
+    )

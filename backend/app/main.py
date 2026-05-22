@@ -21,6 +21,7 @@ from app.db import SessionLocal, get_db, init_db
 from app.models import AuditEvent, DeskSessionRow, InteractionRecord, User
 from app.routers.auth import ensure_seed_admin, router as auth_router
 from app.services.bhashini_client import BhashiniError, bhashini
+from app.services.demo_oracle import SCENARIO_LINES, demo_translate
 from app.services.disclaimers import disclaimers_for_intent
 from app.services.fast_mt import fast_translate
 from app.services.glossary import find_terms_in_text
@@ -65,26 +66,12 @@ app.add_middleware(
 )
 app.include_router(auth_router)
 
-# Demo replay lines — hackathon-friendly (no audio needed)
+# Demo replay lines — hackathon-friendly (no audio needed).
+# Source of truth lives in demo_oracle.SCENARIO_LINES so the offline translator
+# can pair the line with its pre-translated counterpart.
 SCENARIOS: dict[str, dict[str, Any]] = {
-    "loan_enquiry_hi": {
-        "customer_lang": "hi",
-        "lines": [
-            "नमस्ते, मुझे पाँच लाख का पर्सनल लोन चाहिए, EMI कितनी होगी? मेरा PAN है ABCDE1234F।",
-        ],
-    },
-    "account_opening_ta": {
-        "customer_lang": "ta",
-        "lines": [
-            "வணக்கம், சேமிப்பு கணகு திறக்க வேண்டும். என் மொபைல் 9876543210.",
-        ],
-    },
-    "card_dispute_en": {
-        "customer_lang": "en",
-        "lines": [
-            "Hi, I need to dispute a charge of ₹4,500 on my debit card from last Friday.",
-        ],
-    },
+    sid: {"customer_lang": sc["customer_lang"], "lines": [sc["original"]]}
+    for sid, sc in SCENARIO_LINES.items()
 }
 
 
@@ -570,8 +557,11 @@ async def _process_customer_audio(
     api_c: float | None = None
 
     if s.demo_mode or not (s.bhashini_user_id and s.bhashini_ulca_api_key):
-        transcript = "[Demo mode] ग्राहक हिंदी में बोल रहा है — कृपया Bhashini कुंजियाँ सेट करें।"
-        translated = "[Demo mode] Customer speaks Hindi — configure Bhashini keys for live ASR+NMT."
+        # No live ASR keys — surface a tip instead of a confusing line.
+        # In Chrome the browser-side Web Speech API handles live mic ASR, so
+        # this path is only reached from raw audio chunks (not browser-finals).
+        transcript = "[Tip] Use Chrome's mic for live ASR, or pick a scenario / type the customer's words."
+        translated = transcript
         api_c = 0.4
     else:
         try:
@@ -785,20 +775,12 @@ async def desk_ws(
                 cl = str(scenario.get("customer_lang") or sess.customer_lang)
                 prev = sess.customer_lang
                 sess.customer_lang = cl
-                translated = line
-                try:
-                    if (
-                        get_settings().bhashini_user_id
-                        and get_settings().bhashini_ulca_api_key
-                        and cl != sess.staff_lang
-                    ):
-                        translated = await bhashini.translate_text(
-                            source_lang=cl,
-                            target_lang=sess.staff_lang,
-                            text=line,
-                        )
-                except BhashiniError as e:
-                    translated = f"{line}\n[translate: {e}]"
+                # Use fast_translate which handles Bhashini → LLM → demo oracle
+                # fallback chain, so the staff always sees a clean translation.
+                if cl == sess.staff_lang:
+                    translated = line
+                else:
+                    translated, _engine = await fast_translate(line, cl, sess.staff_lang)
                 await _finalize_customer_turn(sess, line, translated, 0.95)
                 sess.customer_lang = prev
 
@@ -821,27 +803,10 @@ async def desk_ws(
                 if not raw:
                     continue
                 lang = msg.get("lang") or sess.customer_lang
-                translated = raw
-                s = get_settings()
-                if (
-                    not s.demo_mode
-                    and s.bhashini_user_id
-                    and s.bhashini_ulca_api_key
-                    and lang != sess.staff_lang
-                ):
-                    try:
-                        translated = await bhashini.translate_text(
-                            source_lang=lang,
-                            target_lang=sess.staff_lang,
-                            text=raw,
-                        )
-                    except BhashiniError as e:
-                        translated = f"{raw}\n[translate error: {e}]"
-                elif lang != sess.staff_lang:
-                    # Try LLM translation as fallback
-                    translated_text, _engine = await fast_translate(raw, lang, sess.staff_lang)
-                    if translated_text:
-                        translated = translated_text
+                if lang == sess.staff_lang:
+                    translated = raw
+                else:
+                    translated, _engine = await fast_translate(raw, lang, sess.staff_lang)
                 await _finalize_customer_turn(sess, raw, translated, 0.99)
 
             elif mtype == "staff_speak":
@@ -850,16 +815,11 @@ async def desk_ws(
                 if not text:
                     continue
                 target = msg.get("target_lang") or sess.customer_lang
-                cust_text = text
-                try:
-                    if get_settings().bhashini_user_id and get_settings().bhashini_ulca_api_key:
-                        cust_text = await bhashini.translate_text(
-                            source_lang=sess.staff_lang,
-                            target_lang=target,
-                            text=text,
-                        )
-                except BhashiniError as e:
-                    cust_text = f"{text}\n[{sess.staff_lang}->{target} translation unavailable: {e}]"
+                # Translation chain: Bhashini → LLM → offline demo phrasebook.
+                if target == sess.staff_lang:
+                    cust_text = text
+                else:
+                    cust_text, _engine = await fast_translate(text, sess.staff_lang, target)
 
                 turn = ConversationTurn(
                     role="staff",
@@ -891,8 +851,9 @@ async def desk_ws(
                         "text_translated": cust_text,
                     }
                 )
-                try:
-                    if get_settings().bhashini_user_id and get_settings().bhashini_ulca_api_key:
+                tts_done = False
+                if get_settings().bhashini_user_id and get_settings().bhashini_ulca_api_key:
+                    try:
                         audio = await bhashini.tts(
                             lang=target,
                             text=cust_text,
@@ -908,8 +869,22 @@ async def desk_ws(
                                 "barge_in_hint": "Start listening to interrupt playback",
                             }
                         )
-                except BhashiniError as e:
-                    await websocket.send_json({"type": "tts_error", "message": str(e)})
+                        tts_done = True
+                    except BhashiniError as e:
+                        await websocket.send_json({"type": "tts_error", "message": str(e)})
+                if not tts_done:
+                    # Browser speechSynthesis fallback — the frontend speaks the
+                    # translated text locally. This keeps the demo audible without
+                    # any external TTS API.
+                    sess.metrics.tts_playouts += 1
+                    await websocket.send_json(
+                        {
+                            "type": "tts_fallback",
+                            "lang": target,
+                            "text": cust_text,
+                            "reason": "no_external_tts_configured",
+                        }
+                    )
 
             elif mtype == "end_session":
                 sess.log_audit("session_ended_by_client", {})
