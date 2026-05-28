@@ -10,7 +10,6 @@ import {
   fetchMe,
   getUser,
   httpBase,
-  login as authLogin,
   wsUrl,
   type AuthUser,
 } from "./auth";
@@ -104,7 +103,7 @@ export default function App() {
   const [copilot, setCopilot] = useState<Record<string, unknown> | null>(null);
   const [summary, setSummary] = useState<Record<string, unknown> | null>(null);
   const [, setSummaryMetrics] = useState<Record<string, unknown> | null>(null);
-  const [liveMetrics, setLiveMetrics] = useState<Record<string, unknown> | null>(null);
+  const [, setLiveMetrics] = useState<Record<string, unknown> | null>(null);
   const [scenarios, setScenarios] = useState<string[]>([]);
   const [partialLine, setPartialLine] = useState("");
   const [serverPartial, setServerPartial] = useState("");
@@ -118,7 +117,7 @@ export default function App() {
   const [sessionLoading, setSessionLoading] = useState(false);
   const [summaryLoading, setSummaryLoading] = useState(false);
 
-  const [privacyRedact, setPrivacyRedact] = useState(false);
+  const [privacyRedact] = useState(false);
   const [fontScale] = useState("1");
   const [highContrast] = useState(false);
   const [captionsMode] = useState(false);
@@ -160,44 +159,17 @@ export default function App() {
     return () => window.clearInterval(id);
   }, [refreshHealth]);
 
-  // Auto-login on mount with the seeded admin so the user opens straight into
-  // the chat. Falls back to the manual login screen only if even silent login
-  // fails (e.g., backend offline or seed admin was deleted).
+  // Validate cached token on mount; if invalid, drop back to login.
   useEffect(() => {
-    let cancelled = false;
+    if (!authUser) return;
     (async () => {
-      if (authUser) {
-        const me = await fetchMe();
-        if (!me && !cancelled) {
-          try {
-            const u = await authLogin("admin@example.com", "ChangeMe!123");
-            if (!cancelled) {
-              setAuthUser(u);
-              setPortal("desk");
-            }
-          } catch {
-            if (!cancelled) {
-              clearAuth();
-              setAuthUser(null);
-              setPortal("gate");
-            }
-          }
-        }
-        return;
-      }
-      try {
-        const u = await authLogin("admin@example.com", "ChangeMe!123");
-        if (!cancelled) {
-          setAuthUser(u);
-          setPortal("desk");
-        }
-      } catch {
-        if (!cancelled) setPortal("gate");
+      const me = await fetchMe();
+      if (!me) {
+        clearAuth();
+        setAuthUser(null);
+        setPortal("gate");
       }
     })().catch(() => undefined);
-    return () => {
-      cancelled = true;
-    };
   }, [authUser]);
 
   useEffect(() => {
@@ -610,8 +582,6 @@ export default function App() {
   const disclaimersStaff = (copilot?.disclaimers_staff as string[] | undefined) || [];
   const disambiguation =
     (copilot?.disambiguation_options as { dimension?: string; choices?: string[]; staff_prompt?: string }[]) || [];
-  const lowConfFallback = copilot?.low_confidence_fallback as string | undefined;
-  const codeMix = copilot?.code_mixing_note as string | undefined;
 
   const formRows = useMemo(
     () =>
@@ -656,6 +626,83 @@ export default function App() {
     setAuthUser(null);
     setPortal("gate");
   };
+
+  // ---------- Dashboard state (must run on every render, before early returns) ----------
+  // Customer-ID state (manual + auto-detected)
+  const [currentCustomerId, setCurrentCustomerId] = useState<string>("");
+  const [customerIdEditing, setCustomerIdEditing] = useState(false);
+  const [customerIdDraft, setCustomerIdDraft] = useState("");
+  const [autoDetectedCid, setAutoDetectedCid] = useState(false);
+
+  // Auto-detect a CIF / Customer ID pattern in any conversation turn and
+  // populate it once (don't override a manually-entered one).
+  const CID_PATTERN = /\b(?:CIF|CID|CUST(?:OMER)?\s*ID)[-\s]?([A-Z0-9]{4,12})\b/i;
+  useEffect(() => {
+    if (currentCustomerId) return;
+    for (const t of lines) {
+      const combined = `${t.text_original} ${t.text_translated}`;
+      const m = combined.match(CID_PATTERN);
+      if (m) {
+        const id = `CIF-${m[1].toUpperCase()}`.replace(/^CIF-CIF-/i, "CIF-");
+        setCurrentCustomerId(id);
+        setAutoDetectedCid(true);
+        addToast(`Customer ID auto-detected: ${id}`, "ok");
+        break;
+      }
+    }
+  }, [lines, currentCustomerId, addToast]);
+
+  // Session history for the sidebar
+  type SessionRow = {
+    id: string;
+    customer_lang: string;
+    staff_lang: string;
+    customer_ref: string;
+    status: string;
+    last_intent: string | null;
+    created_at: string | null;
+  };
+  const [sessionHistory, setSessionHistory] = useState<SessionRow[]>([]);
+  const [historyFilter, setHistoryFilter] = useState("");
+  const refreshHistory = useCallback(async () => {
+    try {
+      const r = await apiFetch("/sessions");
+      if (!r.ok) return;
+      const data = (await r.json()) as { sessions: SessionRow[] };
+      setSessionHistory(data.sessions || []);
+    } catch {
+      /* noop */
+    }
+  }, []);
+  useEffect(() => {
+    if (!authUser) return;
+    void refreshHistory();
+    const id = window.setInterval(() => void refreshHistory(), 12000);
+    return () => window.clearInterval(id);
+  }, [authUser, refreshHistory]);
+  useEffect(() => {
+    if (!sessionId) void refreshHistory();
+  }, [sessionId, summary, refreshHistory]);
+
+  const filteredHistory = useMemo(() => {
+    const f = historyFilter.trim().toLowerCase();
+    if (!f) return sessionHistory.slice(0, 30);
+    return sessionHistory
+      .filter((s) =>
+        (s.customer_ref || "").toLowerCase().includes(f) ||
+        (s.last_intent || "").toLowerCase().includes(f) ||
+        s.id.toLowerCase().includes(f)
+      )
+      .slice(0, 30);
+  }, [sessionHistory, historyFilter]);
+
+  const customerPriorVisits = useMemo(() => {
+    if (!currentCustomerId) return [];
+    const key = currentCustomerId.toLowerCase().replace(/^cif-/, "");
+    return sessionHistory.filter(
+      (s) => (s.customer_ref || "").toLowerCase().replace(/^cif-/, "").includes(key) && s.id !== sessionId
+    );
+  }, [sessionHistory, currentCustomerId, sessionId]);
 
   if (portal === "gate" || !authUser) {
     return (
@@ -730,17 +777,34 @@ export default function App() {
     );
   }
 
-  // ---------- WhatsApp-style chat view ----------
+  // ---------- Dashboard view ----------
   const customerLangLabel = CUSTOMER_LANGS.find((l) => l.code === customerLang)?.label || customerLang;
   const staffLangLabel = STAFF_LANGS.find((l) => l.code === staffLang)?.label?.replace(/\s*\(staff\)$/i, "") || staffLang;
-  const formHasAny = Object.values(form).some((v) => v);
 
-  // Suggested staff replies from copilot (max 3).
+  // Staff profile
+  const staffName = authUser?.full_name || authUser?.email || "Staff";
+  const staffInitials = staffName.split(/\s+/).map((p) => p[0]).join("").slice(0, 2).toUpperCase();
+  const staffRole = authUser?.role || "staff";
+
+  // Start a brand new session (resets state). Used by "+ New chat".
+  const newChat = async () => {
+    if (sessionId) await endSession();
+    setCurrentCustomerId("");
+    setCustomerIdDraft("");
+    setCustomerIdEditing(false);
+    setAutoDetectedCid(false);
+    setLines([]);
+    setForm({});
+    setCopilot(null);
+    setSummary(null);
+    setSummaryMetrics(null);
+    await startSession();
+  };
+
+  // Suggested staff replies from copilot (max 3, dedup)
   const suggested: string[] = [];
-  for (const d of disambiguation) if (d.staff_prompt && suggested.length < 3) suggested.push(d.staff_prompt);
-  for (const tp of talkingPoints) if (suggested.length < 3) suggested.push(tp);
-
-  const [moreOpen, setMoreOpen] = useState(false);
+  for (const d of disambiguation) if (d.staff_prompt && !suggested.includes(d.staff_prompt) && suggested.length < 3) suggested.push(d.staff_prompt);
+  for (const tp of talkingPoints) if (!suggested.includes(tp) && suggested.length < 3) suggested.push(tp);
 
   const sendStaffReply = () => {
     if (!staffText.trim()) return;
@@ -748,348 +812,443 @@ export default function App() {
     setStaffText("");
   };
 
-  // Changing language while in a session — auto-restart with the new pair.
-  const changeCustomerLang = async (next: string) => {
-    setCustomerLang(next);
-    if (sessionId) {
-      addToast(`Switching customer language → ${next.toUpperCase()}…`, "info");
-      await endSession();
-      autoStartRef.current = false;
-    }
-  };
-  const changeStaffLang = async (next: string) => {
-    setStaffLang(next);
-    if (sessionId) {
-      await endSession();
-      autoStartRef.current = false;
-    }
+  // Split turns by role for the two-pane layout
+  const customerTurns = lines.filter((l) => l.role === "customer");
+  const staffTurns = lines.filter((l) => l.role === "staff");
+
+  // Compact summary (key points only)
+  const products = ((summary?.products_discussed as string[] | undefined) || []);
+  const actionItems = ((summary?.action_items as string[] | undefined) || []);
+  const intentLabel = typeof copilot?.intent === "string" ? copilot.intent.replace(/_/g, " ") : "—";
+  const intentConf = typeof copilot?.intent_confidence === "number" ? Math.round(copilot.intent_confidence * 100) : null;
+
+  const saveCustomerId = () => {
+    const trimmed = customerIdDraft.trim();
+    if (!trimmed) return;
+    const formatted = /^cif|cid/i.test(trimmed) ? trimmed.toUpperCase() : `CIF-${trimmed.toUpperCase()}`;
+    setCurrentCustomerId(formatted);
+    setAutoDetectedCid(false);
+    setCustomerIdEditing(false);
+    addToast(`Customer ID set: ${formatted}`, "ok");
   };
 
   return (
-    <div className="chat-shell">
+    <div className="dash">
       {apiOffline && (
         <div className="banner-offline">Backend offline — start the FastAPI server on port 8000.</div>
       )}
 
-      <header className="chat-header">
-        <div className="chat-brand">
+      {/* ----- SIDEBAR ----- */}
+      <aside className="dash-sidebar">
+        <div className="dash-sidebar-brand">
           <div className="brand-logo" aria-hidden>FD</div>
-          <div className="brand-text">
+          <div>
             <strong>Frontline Desk</strong>
-            <span>Multilingual voice assistant</span>
+            <span>Branch voice assistant</span>
           </div>
         </div>
 
-        <div className="chat-langs">
-          <label className="lang-picker">
-            <span>Customer</span>
-            <select value={customerLang} onChange={(e) => void changeCustomerLang(e.target.value)}>
-              {CUSTOMER_LANGS.map((l) => (
-                <option key={l.code} value={l.code}>{l.label}</option>
-              ))}
-            </select>
-          </label>
-          <span className="lang-swap" aria-hidden>⇄</span>
-          <label className="lang-picker">
-            <span>Staff</span>
-            <select value={staffLang} onChange={(e) => void changeStaffLang(e.target.value)}>
-              {STAFF_LANGS.map((l) => (
-                <option key={l.code} value={l.code}>{l.label}</option>
-              ))}
-            </select>
-          </label>
+        <button type="button" className="new-chat-btn" onClick={() => void newChat()}>
+          <span className="plus">＋</span> New conversation
+        </button>
+
+        <div className="sidebar-search">
+          <input
+            value={historyFilter}
+            onChange={(e) => setHistoryFilter(e.target.value)}
+            placeholder="Search customer ID or intent…"
+          />
         </div>
 
-        <div className="chat-header-actions">
-          <button
-            type="button"
-            className="icon-btn"
-            title="Copilot guidance"
-            onClick={() => setMoreOpen(true)}
-            aria-label="Copilot guidance"
-          >
-            <span className="icon-glyph">ⓘ</span>
-            {typeof copilot?.intent === "string" && copilot.intent !== "generic" && <span className="icon-badge" />}
-          </button>
-          <ThemeToggle />
-          <button type="button" className="icon-btn icon-btn-text" onClick={() => void staffSignOut()} title="Sign out">
-            ⏻
-          </button>
-        </div>
-      </header>
-
-      {!!scenarios.length && (
-        <div className="scenario-strip">
-          <span className="strip-label">Try:</span>
-          {scenarios.map((s) => {
-            const pretty = s
-              .replace(/_/g, " ")
-              .replace(/\b(hi|ta|te|kn|ml|bn|mr|gu|pa|or|en)\b/i, (m) => m.toUpperCase());
+        <div className="sidebar-history">
+          <div className="sidebar-section">Recent</div>
+          {filteredHistory.length === 0 && (
+            <div className="sidebar-empty">No prior conversations.</div>
+          )}
+          {filteredHistory.map((s) => {
+            const isCurrent = s.id === sessionId;
+            const ts = s.created_at ? new Date(s.created_at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+            const label = s.customer_ref || "Walk-in";
             return (
-              <button key={s} type="button" className="strip-chip" onClick={() => injectScenario(s)} disabled={!connected}>
-                ▸ {pretty}
+              <button
+                key={s.id}
+                type="button"
+                className={`history-item ${isCurrent ? "history-item-active" : ""}`}
+                onClick={() => {
+                  if (s.customer_ref && !currentCustomerId) {
+                    setCurrentCustomerId(s.customer_ref);
+                    addToast(`Loaded customer: ${s.customer_ref}`, "info");
+                  }
+                  setHistoryFilter("");
+                }}
+                title={s.id}
+              >
+                <div className="history-top">
+                  <span className="history-id">{label}</span>
+                  <span className="history-status">{s.status}</span>
+                </div>
+                <div className="history-bot">
+                  <span>{s.last_intent ? s.last_intent.replace(/_/g, " ") : "—"}</span>
+                  <span className="mono">{ts}</span>
+                </div>
               </button>
             );
           })}
-          <button
-            type="button"
-            className="strip-chip strip-chip-primary"
-            onClick={() => void runGuidedDemo()}
-            disabled={guidedRunning}
-          >
-            {guidedRunning ? "Running…" : "🎬 Guided demo"}
-          </button>
         </div>
-      )}
 
-      <div className="chat-body">
-        <main className="chat-main" ref={feedRef}>
-          {lines.length === 0 && (
-            <div className="chat-empty">
-              <div className="chat-empty-icon">🎙</div>
-              <h2>Tap the mic to start</h2>
-              <p>
-                The customer speaks <strong>{customerLangLabel}</strong>. You'll read it in <strong>{staffLangLabel}</strong>.
-                Type or speak your reply — we translate it back and read it out for the customer.
-              </p>
-              {!!scenarios.length && (
-                <p className="chat-empty-hint">
-                  Or click a ▸ scenario chip above to try a sample conversation.
-                </p>
-              )}
-            </div>
-          )}
+        <div className="sidebar-profile">
+          <div className="profile-avatar">{staffInitials}</div>
+          <div className="profile-meta">
+            <strong>{staffName}</strong>
+            <span>{staffRole === "admin" ? "Branch admin" : "Branch staff"}</span>
+          </div>
+          <button type="button" className="profile-signout" onClick={() => void staffSignOut()} title="Sign out">⏻</button>
+        </div>
+      </aside>
 
-          {lines.map((l, i) => (
-            <div key={i} className={`chat-row chat-row-${l.role}`}>
-              <div className={`chat-bubble chat-bubble-${l.role}`}>
-                <div className="chat-bubble-original">{displayText(l.text_original)}</div>
-                {l.text_translated && l.text_translated !== l.text_original && (
-                  <div className="chat-bubble-trans">{displayText(l.text_translated)}</div>
-                )}
-                <div className="chat-bubble-meta">
-                  <span className="chat-bubble-lang">{l.source_lang.toUpperCase()}</span>
-                  {l.role === "customer" && typeof l.confidence === "number" && (
-                    <span className="chat-bubble-conf" title={`ASR confidence ${(l.confidence * 100).toFixed(0)}%`}>
-                      {(l.confidence * 100).toFixed(0)}%
-                    </span>
-                  )}
-                  {l.low_confidence && <span className="chat-bubble-warn">low confidence</span>}
+      {/* ----- MAIN ----- */}
+      <main className="dash-main">
+        {/* Customer-info top bar */}
+        <header className="dash-topbar">
+          <div className="cust-info">
+            {!currentCustomerId && !customerIdEditing && (
+              <div className="cust-info-empty">
+                <span className="cust-dot cust-dot-walkin" />
+                <div>
+                  <strong>Walk-in customer</strong>
+                  <span>No customer ID yet — fine for new accounts. Add one later when asked.</span>
                 </div>
-                {!!l.glossary?.length && (
-                  <div className="chat-bubble-tags">
-                    {l.glossary.slice(0, 4).map((g) => (
-                      <span key={g.term} className="tag" title={g.definition}>{g.term}</span>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </div>
-          ))}
-
-          {(partialLine || serverPartial) && listening && (
-            <div className="chat-row chat-row-customer">
-              <div className="chat-bubble chat-bubble-customer chat-bubble-partial">
-                <span className="dot-typing"><i /><i /><i /></span>
-                <span>{displayText(partialLine || serverPartial)}</span>
-              </div>
-            </div>
-          )}
-        </main>
-
-        <aside className="chat-rail">
-          <details className="rail-card" open={formHasAny}>
-            <summary>
-              <span>Customer details</span>
-              {formHasAny && <span className="rail-meta">live</span>}
-            </summary>
-            <div className="rail-body">
-              {!formHasAny && <p className="muted">Auto-fills as the customer shares details.</p>}
-              {formHasAny && (
-                <ul className="form-list">
-                  {formRows.map(([k, label]) =>
-                    form[k] ? (
-                      <li key={k}>
-                        <span className="form-list-label">{label}</span>
-                        <span className="form-list-value">{displayText(String(form[k]))}</span>
-                      </li>
-                    ) : null
-                  )}
-                </ul>
-              )}
-            </div>
-          </details>
-
-          <details className="rail-card">
-            <summary><span>Summary &amp; export</span></summary>
-            <div className="rail-body">
-              <div className="rail-actions">
-                <button type="button" onClick={() => void genSummary()} disabled={summaryLoading || !sessionId}>
-                  {summaryLoading ? "Generating…" : "📝 Generate summary"}
-                </button>
-                <button type="button" className="secondary" onClick={() => void exportPacket(true)} disabled={!sessionId}>
-                  Export (redacted)
+                <button type="button" className="link-btn" onClick={() => { setCustomerIdEditing(true); setCustomerIdDraft(""); }}>
+                  ＋ Add customer ID
                 </button>
               </div>
-              {!!summary && (
-                <div className="rail-summary">
-                  <div className="block">
-                    <h4>In {staffLangLabel}</h4>
-                    <p>{displayText(String(summary.summary_staff_lang ?? ""))}</p>
-                  </div>
-                  <div className="block">
-                    <h4>In {customerLangLabel}</h4>
-                    <p>{displayText(String(summary.summary_customer_lang ?? ""))}</p>
-                  </div>
+            )}
+
+            {customerIdEditing && (
+              <div className="cust-info-edit">
+                <input
+                  autoFocus
+                  value={customerIdDraft}
+                  onChange={(e) => setCustomerIdDraft(e.target.value)}
+                  placeholder="e.g. 102938 or CIF-102938"
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") saveCustomerId();
+                    if (e.key === "Escape") setCustomerIdEditing(false);
+                  }}
+                />
+                <button type="button" onClick={saveCustomerId} disabled={!customerIdDraft.trim()}>Save</button>
+                <button type="button" className="secondary" onClick={() => setCustomerIdEditing(false)}>Cancel</button>
+              </div>
+            )}
+
+            {currentCustomerId && !customerIdEditing && (
+              <div className="cust-info-known">
+                <span className="cust-dot cust-dot-known" />
+                <div className="cust-info-block">
+                  <strong>
+                    {currentCustomerId}
+                    {autoDetectedCid && <span className="cust-auto-tag">✨ auto-detected</span>}
+                  </strong>
+                  <span>
+                    {customerPriorVisits.length > 0
+                      ? `${customerPriorVisits.length} prior visit${customerPriorVisits.length === 1 ? "" : "s"}`
+                      : "No prior visits on file"}
+                    {form.full_name && <> · <span className="mono">{displayText(String(form.full_name))}</span></>}
+                  </span>
                 </div>
-              )}
-            </div>
-          </details>
-
-          <details className="rail-card">
-            <summary>
-              <span>Session</span>
-              {liveMetrics && <span className="rail-meta">{String(liveMetrics.session_seconds)}s</span>}
-            </summary>
-            <div className="rail-body rail-session">
-              <div className="kv-mini">
-                <div>Customer</div><div>{customerLangLabel}</div>
-                <div>Staff</div><div>{staffLangLabel}</div>
-                {servingCustomerRef && (<><div>Ref</div><div className="mono">{servingCustomerRef}</div></>)}
-                {liveMetrics && (<><div>Turns</div><div>{String(liveMetrics.total_turns)}</div></>)}
-              </div>
-              <div className="rail-actions">
-                <button type="button" className="danger" onClick={() => void endSession()} disabled={!sessionId}>
-                  End session
+                <button type="button" className="link-btn" onClick={() => { setCustomerIdEditing(true); setCustomerIdDraft(currentCustomerId.replace(/^CIF-/, "")); }}>
+                  Edit
                 </button>
               </div>
-              <label className="rail-toggle">
-                <input type="checkbox" checked={privacyRedact} onChange={(e) => setPrivacyRedact(e.target.checked)} />
-                Redact PII on screen
-              </label>
-            </div>
-          </details>
-        </aside>
-      </div>
+            )}
+          </div>
 
-      <footer className="chat-dock">
-        <button
-          type="button"
-          className={`mic-fab ${listening ? "mic-fab-on" : ""}`}
-          onClick={() => void toggleListen()}
-          disabled={!connected}
-          title={listening ? "Stop listening" : `Listen to customer (${customerLangLabel})`}
-        >
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-            <path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
-            <path d="M19 10v1a7 7 0 0 1-14 0v-1" />
-            <line x1="12" y1="18" x2="12" y2="22" />
-            <line x1="8" y1="22" x2="16" y2="22" />
-          </svg>
-          <span>{listening ? "Listening…" : `Listen (${customerLangLabel})`}</span>
-        </button>
+          <div className="topbar-langs">
+            <label>
+              <span>Customer</span>
+              <select
+                value={customerLang}
+                onChange={(e) => setCustomerLang(e.target.value)}
+                disabled={connected}
+                title={connected ? "End the session to change language" : "Pick the customer's language"}
+              >
+                {CUSTOMER_LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
+              </select>
+            </label>
+            <span className="lang-swap" aria-hidden>⇄</span>
+            <label>
+              <span>Staff</span>
+              <select value={staffLang} onChange={(e) => setStaffLang(e.target.value)} disabled={connected}>
+                {STAFF_LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
+              </select>
+            </label>
+          </div>
 
-        <div className="dock-reply">
-          {suggested.length > 0 && (
-            <div className="dock-suggested">
-              {suggested.map((s, i) => (
-                <button key={i} type="button" className="dock-suggest-chip" onClick={() => setStaffText(s)} title="Use this reply">
-                  {s.length > 80 ? s.slice(0, 80) + "…" : s}
-                </button>
-              ))}
-            </div>
-          )}
-          <div className="dock-input-row">
-            <textarea
-              value={staffText}
-              onChange={(e) => onStaffTextChange(e.target.value)}
-              placeholder={`Type your reply in ${staffLangLabel}…`}
-              rows={2}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-                  e.preventDefault();
-                  sendStaffReply();
-                }
-              }}
-            />
+          <div className="topbar-actions">
             <button
               type="button"
-              className="send-fab"
-              onClick={sendStaffReply}
-              disabled={!connected || !staffText.trim()}
-              title={`Translate & speak in ${customerLangLabel}`}
+              className="secondary"
+              onClick={() => void runGuidedDemo()}
+              disabled={guidedRunning}
+              title="Auto-plays a sample conversation"
             >
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                <path d="M22 2L11 13" />
-                <path d="M22 2l-7 20-4-9-9-4 20-7z" />
-              </svg>
+              {guidedRunning ? "Running…" : "🎬 Demo"}
             </button>
+            {!sessionId && (
+              <button type="button" onClick={() => void startSession()} disabled={sessionLoading}>
+                {sessionLoading ? "Starting…" : "▶ Start session"}
+              </button>
+            )}
+            {sessionId && (
+              <button type="button" className="danger" onClick={() => void endSession()}>
+                End
+              </button>
+            )}
           </div>
-          {staffTranslationPreview && (
-            <div className="dock-preview">
-              <span className="dock-preview-label">In {customerLangLabel}:</span> {staffTranslationPreview}
-            </div>
-          )}
-        </div>
-      </footer>
+        </header>
 
-      {moreOpen && (
-        <div className="more-overlay" onClick={() => setMoreOpen(false)}>
-          <aside className="more-drawer" onClick={(e) => e.stopPropagation()}>
-            <header className="more-head">
-              <h3>Copilot</h3>
-              <button type="button" className="icon-btn" onClick={() => setMoreOpen(false)} aria-label="Close">✕</button>
+        {/* Two-pane conversation */}
+        <div className="dash-convo">
+          {/* LEFT: Customer pane */}
+          <section className="convo-pane convo-pane-customer">
+            <header className="convo-head">
+              <h2>
+                <span className="head-dot head-dot-customer" />
+                Customer
+              </h2>
+              <span className="convo-lang">{customerLangLabel}</span>
             </header>
-            <div className="more-body">
-              {!copilot && <p className="muted">Once the customer speaks, intent, talking points and disclaimers appear here.</p>}
-              {typeof copilot?.intent === "string" && copilot.intent !== "generic" && (
-                <div className="block">
-                  <h4>Detected intent</h4>
-                  <p><strong className="intent-badge">{copilot.intent.replace(/_/g, " ")}</strong></p>
+
+            <div className="convo-feed">
+              {customerTurns.length === 0 && (
+                <div className="convo-empty">
+                  <div className="convo-empty-icon">🎙</div>
+                  <p>Press the mic below or pick a scenario. The customer's speech appears here in their language and is translated to your language for context.</p>
                 </div>
               )}
-              {lowConfFallback && <p className="hint">{lowConfFallback}</p>}
-              {codeMix && <p className="hint">{codeMix}</p>}
-              {!!talkingPoints.length && (
-                <div className="block">
-                  <h4>Talking points</h4>
-                  <ul>{talkingPoints.map((t, i) => <li key={i}>{t}</li>)}</ul>
-                </div>
-              )}
-              {!!processGuide.length && (
-                <div className="block">
-                  <h4>Process guide</h4>
-                  <ol>{processGuide.map((t, i) => <li key={i}>{t}</li>)}</ol>
-                </div>
-              )}
-              {!!disclaimersStaff.length && (
-                <div className="block">
-                  <h4>Regulatory disclaimers</h4>
-                  <ul>{disclaimersStaff.map((t, i) => <li key={i}>{t}</li>)}</ul>
-                </div>
-              )}
-              {!!agentGuidelines && (
-                <div className="block">
-                  <h4>Agent guidelines · {agentGuidelines.priority}</h4>
-                  {!!agentGuidelines.auto_checklist?.length && (
-                    <ol>{agentGuidelines.auto_checklist.map((x, i) => <li key={i}>{x}</li>)}</ol>
+              {customerTurns.map((l, i) => (
+                <article key={`c-${i}`} className="convo-turn convo-turn-customer">
+                  <div className="convo-turn-original">{displayText(l.text_original)}</div>
+                  {l.text_translated && l.text_translated !== l.text_original && (
+                    <div className="convo-turn-trans">↳ {displayText(l.text_translated)}</div>
                   )}
-                  <div className="dos-donts">
-                    <div>
-                      <strong className="ok-inline">Do</strong>
-                      <ul>{(agentGuidelines.dos || []).map((x, i) => <li key={i}>{x}</li>)}</ul>
-                    </div>
-                    <div>
-                      <strong className="no-inline">Don't</strong>
-                      <ul>{(agentGuidelines.donts || []).map((x, i) => <li key={i}>{x}</li>)}</ul>
-                    </div>
+                  <div className="convo-turn-meta">
+                    <span>{l.source_lang.toUpperCase()}</span>
+                    {typeof l.confidence === "number" && (
+                      <span title={`ASR confidence ${(l.confidence * 100).toFixed(0)}%`}>
+                        {(l.confidence * 100).toFixed(0)}%
+                      </span>
+                    )}
+                    {l.low_confidence && <span className="warn">low conf</span>}
+                  </div>
+                </article>
+              ))}
+              {(partialLine || serverPartial) && listening && (
+                <article className="convo-turn convo-turn-customer convo-turn-partial">
+                  <span className="dot-typing"><i /><i /><i /></span>
+                  <span>{displayText(partialLine || serverPartial)}</span>
+                </article>
+              )}
+            </div>
+
+            <div className="convo-input">
+              <button
+                type="button"
+                className={`mic-fab ${listening ? "mic-fab-on" : ""}`}
+                onClick={() => void toggleListen()}
+                disabled={!connected}
+              >
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                  <path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
+                  <path d="M19 10v1a7 7 0 0 1-14 0v-1" />
+                  <line x1="12" y1="18" x2="12" y2="22" />
+                  <line x1="8" y1="22" x2="16" y2="22" />
+                </svg>
+                <span>{listening ? "Listening… tap to stop" : `Listen (${customerLangLabel})`}</span>
+              </button>
+              <div className="convo-fallback">
+                <input
+                  value={customerTextInput}
+                  onChange={(e) => setCustomerTextInput(e.target.value)}
+                  placeholder={`Or type what customer said in ${customerLangLabel}…`}
+                  disabled={!connected}
+                  onKeyDown={(e) => { if (e.key === "Enter") sendCustomerText(); }}
+                />
+                <button type="button" className="secondary" onClick={sendCustomerText} disabled={!connected || !customerTextInput.trim()}>Send</button>
+              </div>
+              {!!scenarios.length && (
+                <div className="convo-scenarios">
+                  {scenarios.map((s) => {
+                    const pretty = s.replace(/_/g, " ").replace(/\b(gu|hi|ta|te|kn|ml|bn|mr|pa|or|en)\b/i, (m) => m.toUpperCase());
+                    return (
+                      <button key={s} type="button" className="strip-chip" onClick={() => injectScenario(s)} disabled={!connected}>
+                        ▸ {pretty}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </section>
+
+          {/* RIGHT: Staff pane */}
+          <section className="convo-pane convo-pane-staff">
+            <header className="convo-head">
+              <h2>
+                <span className="head-dot head-dot-staff" />
+                Staff
+              </h2>
+              <span className="convo-lang">{staffLangLabel}</span>
+            </header>
+
+            <div className="convo-feed">
+              {staffTurns.length === 0 && (
+                <div className="convo-empty">
+                  <div className="convo-empty-icon">💬</div>
+                  <p>Your replies appear here. Type below or pick a suggested reply — we translate to {customerLangLabel} and speak it out loud for the customer.</p>
+                </div>
+              )}
+              {staffTurns.map((l, i) => (
+                <article key={`s-${i}`} className="convo-turn convo-turn-staff">
+                  <div className="convo-turn-original">{displayText(l.text_original)}</div>
+                  {l.text_translated && l.text_translated !== l.text_original && (
+                    <div className="convo-turn-trans">↳ in {customerLangLabel}: {displayText(l.text_translated)}</div>
+                  )}
+                  <div className="convo-turn-meta">
+                    <span>{l.source_lang.toUpperCase()}</span>
+                    <span>spoken</span>
+                  </div>
+                </article>
+              ))}
+            </div>
+
+            <div className="convo-input">
+              {(processGuide.length > 0 || disclaimersStaff.length > 0 || agentGuidelines) && (
+                <details className="guidance-card">
+                  <summary>
+                    <span>Copilot guidance</span>
+                    {agentGuidelines?.priority && <span className={`guidance-pri pri-${agentGuidelines.priority}`}>{agentGuidelines.priority}</span>}
+                  </summary>
+                  <div className="guidance-body">
+                    {!!processGuide.length && (
+                      <div className="guidance-block">
+                        <h4>Process guide</h4>
+                        <ol>{processGuide.slice(0, 4).map((t, i) => <li key={i}>{t}</li>)}</ol>
+                      </div>
+                    )}
+                    {!!disclaimersStaff.length && (
+                      <div className="guidance-block">
+                        <h4>Regulatory disclaimers</h4>
+                        <ul>{disclaimersStaff.slice(0, 3).map((t, i) => <li key={i}>{t}</li>)}</ul>
+                      </div>
+                    )}
+                    {!!agentGuidelines && (
+                      <div className="guidance-block guidance-dosdonts">
+                        <div>
+                          <strong className="ok-inline">Do</strong>
+                          <ul>{(agentGuidelines.dos || []).slice(0, 3).map((x, i) => <li key={i}>{x}</li>)}</ul>
+                        </div>
+                        <div>
+                          <strong className="no-inline">Don't</strong>
+                          <ul>{(agentGuidelines.donts || []).slice(0, 3).map((x, i) => <li key={i}>{x}</li>)}</ul>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </details>
+              )}
+              {suggested.length > 0 && (
+                <div className="suggested-wrap">
+                  <div className="suggested-label">Suggested replies</div>
+                  <div className="suggested-list">
+                    {suggested.map((s, i) => (
+                      <button key={i} type="button" className="suggest-chip" onClick={() => setStaffText(s)} title={s}>
+                        {s.length > 90 ? s.slice(0, 90) + "…" : s}
+                      </button>
+                    ))}
                   </div>
                 </div>
               )}
+              <div className="staff-input-row">
+                <textarea
+                  value={staffText}
+                  onChange={(e) => onStaffTextChange(e.target.value)}
+                  placeholder={`Type your reply in ${staffLangLabel}…  (⌘/Ctrl + Enter to send)`}
+                  rows={2}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); sendStaffReply(); }
+                  }}
+                />
+                <button
+                  type="button"
+                  className="send-fab"
+                  onClick={sendStaffReply}
+                  disabled={!connected || !staffText.trim()}
+                  title={`Translate & speak in ${customerLangLabel}`}
+                >
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                    <path d="M22 2L11 13" />
+                    <path d="M22 2l-7 20-4-9-9-4 20-7z" />
+                  </svg>
+                </button>
+              </div>
+              {staffTranslationPreview && (
+                <div className="staff-preview">
+                  <span>In {customerLangLabel}:</span> {staffTranslationPreview}
+                </div>
+              )}
             </div>
-          </aside>
+          </section>
         </div>
-      )}
+
+        {/* Compact summary */}
+        <section className="dash-summary">
+          <header>
+            <h3>Live summary</h3>
+            <div className="summary-actions">
+              <button type="button" className="secondary" onClick={() => void genSummary()} disabled={!sessionId || summaryLoading}>
+                {summaryLoading ? "Generating…" : "📝 Generate full summary"}
+              </button>
+              <button type="button" className="secondary" onClick={() => void exportPacket(true)} disabled={!sessionId}>
+                Export (redacted)
+              </button>
+            </div>
+          </header>
+          <div className="summary-grid">
+            <div className="summary-card">
+              <div className="summary-card-label">Intent</div>
+              <div className="summary-card-value">
+                {intentLabel}{intentConf !== null && <span className="muted"> · {intentConf}%</span>}
+              </div>
+            </div>
+            <div className="summary-card">
+              <div className="summary-card-label">Products discussed</div>
+              <div className="summary-card-value">
+                {products.length ? products.join(", ") : "—"}
+              </div>
+            </div>
+            <div className="summary-card">
+              <div className="summary-card-label">Customer details captured</div>
+              <div className="summary-card-value">
+                {formRows.filter(([k]) => form[k]).map(([k, label]) => (
+                  <div key={k}><span className="muted">{label}:</span> <span className="mono">{displayText(String(form[k]))}</span></div>
+                ))}
+                {!formRows.some(([k]) => form[k]) && <span className="muted">None yet</span>}
+              </div>
+            </div>
+            <div className="summary-card">
+              <div className="summary-card-label">Action items</div>
+              <div className="summary-card-value">
+                {actionItems.length ? (
+                  <ul>{actionItems.slice(0, 4).map((a, i) => <li key={i}>{a}</li>)}</ul>
+                ) : (
+                  <span className="muted">Click <em>Generate full summary</em> after the chat.</span>
+                )}
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
 
       {toasts.length > 0 && (
         <div className="toast-stack">
