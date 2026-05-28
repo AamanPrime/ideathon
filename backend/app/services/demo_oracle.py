@@ -1,12 +1,12 @@
-"""Offline demo oracle — makes the whole product demo-able WITHOUT Bhashini or LLM keys.
+"""Silent offline fallback for translation, copilot enrichment, form
+extraction, and summary generation.
 
 Each existing service (fast_translate, enrich_turn, extract_form_and_signals,
-bilingual_summary) calls into here as a *last-resort fallback*. When real keys
-are configured, the oracle is bypassed entirely; when they aren't, it produces
-plausible, banking-grade, bilingual content so judges always see the full UX.
-
-Nothing here is meant to replace production translation / NLP — it's curated
-phraseology for the canonical hackathon demo scenarios.
+bilingual_summary) calls into here as a *last-resort fallback* only when the
+configured real provider (Bhashini, MyMemory, Groq/OpenAI) is unavailable or
+unconfigured. When the real providers respond, this module is bypassed. None
+of it is surfaced to the UI — there are no demo scenarios or canned content
+exposed through the API.
 """
 
 from __future__ import annotations
@@ -15,81 +15,7 @@ import re
 from typing import Any
 
 # ---------------------------------------------------------------------------
-# 1. Scenario-level demo lines (the "inject scenario" buttons)
-# ---------------------------------------------------------------------------
-
-# Each canonical line has an exact translation in the staff language (English).
-# When the customer_lang != staff_lang and neither Bhashini nor LLM are wired,
-# we use these exact pairs.
-SCENARIO_LINES: dict[str, dict[str, Any]] = {
-    "loan_enquiry_gu": {
-        "customer_lang": "gu",
-        "staff_lang": "en",
-        "intent": "loan_enquiry",
-        "original": "નમસ્તે, મારે પાંચ લાખનું પર્સનલ લોન જોઈએ છે, EMI કેટલી થશે? મારો PAN છે ABCDE1234F.",
-        "translated_en": "Hello, I need a personal loan of five lakh rupees. What would the EMI be? My PAN is ABCDE1234F.",
-        "form_seed": {"pan": "ABCDE1234F"},
-        "products_discussed": ["Personal loan"],
-    },
-    "account_opening_gu": {
-        "customer_lang": "gu",
-        "staff_lang": "en",
-        "intent": "account_opening",
-        "original": "નમસ્તે, મારે બચત ખાતું ખોલવું છે. મારો મોબાઇલ નંબર 9876543210 છે.",
-        "translated_en": "Hello, I would like to open a savings account. My mobile number is 9876543210.",
-        "form_seed": {"phone": "9876543210"},
-        "products_discussed": ["Savings account"],
-    },
-    "loan_enquiry_hi": {
-        "customer_lang": "hi",
-        "staff_lang": "en",
-        "intent": "loan_enquiry",
-        "original": "नमस्ते, मुझे पाँच लाख का पर्सनल लोन चाहिए, EMI कितनी होगी? मेरा PAN है ABCDE1234F।",
-        "translated_en": "Hello, I need a personal loan of five lakh rupees. What would the EMI be? My PAN is ABCDE1234F.",
-        "form_seed": {"pan": "ABCDE1234F"},
-        "products_discussed": ["Personal loan"],
-    },
-    "account_opening_ta": {
-        "customer_lang": "ta",
-        "staff_lang": "en",
-        "intent": "account_opening",
-        "original": "வணக்கம், சேமிப்பு கணக்கு திறக்க வேண்டும். என் மொபைல் 9876543210.",
-        "translated_en": "Hello, I would like to open a savings account. My mobile number is 9876543210.",
-        "form_seed": {"phone": "9876543210"},
-        "products_discussed": ["Savings account"],
-    },
-    "card_dispute_en": {
-        "customer_lang": "en",
-        "staff_lang": "en",
-        "intent": "card_dispute",
-        "original": "Hi, I need to dispute a charge of ₹4,500 on my debit card from last Friday.",
-        "translated_en": "Hi, I need to dispute a charge of ₹4,500 on my debit card from last Friday.",
-        "form_seed": {},
-        "products_discussed": ["Debit card dispute"],
-    },
-    "remittance_kn": {
-        "customer_lang": "kn",
-        "staff_lang": "en",
-        "intent": "remittance",
-        "original": "ನಮಸ್ಕಾರ, ನನಗೆ ೨೫೦೦೦ ರೂಪಾಯಿ ಬೇರೆ ಬ್ಯಾಂಕ್‌ಗೆ NEFT ಮಾಡಬೇಕು. IFSC ಸಿಕ್ಕಿದೆ.",
-        "translated_en": "Hello, I need to send ₹25,000 to another bank via NEFT. I have the IFSC code.",
-        "form_seed": {},
-        "products_discussed": ["NEFT remittance"],
-    },
-    "locker_te": {
-        "customer_lang": "te",
-        "staff_lang": "en",
-        "intent": "locker",
-        "original": "నమస్కారం, నాకు లాకర్ కావాలి. చిన్న సైజు ఉందా?",
-        "translated_en": "Hello, I would like to take a locker. Do you have a small size available?",
-        "form_seed": {},
-        "products_discussed": ["Safe deposit locker"],
-    },
-}
-
-
-# ---------------------------------------------------------------------------
-# 2. Phrasebook for word/phrase-level translation of free-text inputs
+# 1. Phrasebook for word/phrase-level translation of free-text inputs
 # ---------------------------------------------------------------------------
 
 # Used both to translate staff replies into the customer language and to give
@@ -366,12 +292,6 @@ def demo_translate(text: str, source_lang: str, target_lang: str) -> str:
     """
     if not text or source_lang == target_lang:
         return text
-
-    # 1. Scenario-line exact match — needed because the demo "inject scenario"
-    #    sends a full Hindi/Tamil sentence we want a clean English line for.
-    for sc in SCENARIO_LINES.values():
-        if sc["customer_lang"] == source_lang and text.strip() == sc["original"].strip():
-            return sc["translated_en"] if target_lang == "en" else text
 
     book = PHRASEBOOK.get((source_lang, target_lang))
     if not book:

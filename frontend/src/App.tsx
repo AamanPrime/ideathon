@@ -104,13 +104,10 @@ export default function App() {
   const [summary, setSummary] = useState<Record<string, unknown> | null>(null);
   const [, setSummaryMetrics] = useState<Record<string, unknown> | null>(null);
   const [, setLiveMetrics] = useState<Record<string, unknown> | null>(null);
-  const [scenarios, setScenarios] = useState<string[]>([]);
   const [partialLine, setPartialLine] = useState("");
   const [serverPartial, setServerPartial] = useState("");
 
-  const [staffText, setStaffText] = useState(
-    "I will help you with account opening. May I verify your mobile number linked to your Aadhaar?"
-  );
+  const [staffText, setStaffText] = useState("");
   const [staffTranslationPreview, setStaffTranslationPreview] = useState("");
   const [customerTextInput, setCustomerTextInput] = useState("");
   const [toasts, setToasts] = useState<{id: number; msg: string; type: "info" | "error" | "ok"}[]>([]);
@@ -375,7 +372,6 @@ export default function App() {
       return;
     }
     const data = await r.json();
-    if (data.scenarios) setScenarios(data.scenarios as string[]);
     setSessionLoading(false);
     setSessionId(data.session_id);
     const ws = new WebSocket(wsUrl(`/ws/desk/${data.session_id}`));
@@ -390,7 +386,6 @@ export default function App() {
     };
     ws.onmessage = (ev) => {
       const msg = JSON.parse(ev.data as string);
-      if (msg.type === "ready" && msg.scenarios) setScenarios(msg.scenarios as string[]);
       if (msg.type === "transcript") {
         setLines((prev) => [
           ...prev,
@@ -542,38 +537,6 @@ export default function App() {
     URL.revokeObjectURL(a.href);
   };
 
-  const injectScenario = (scenarioId: string) => {
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-    wsRef.current.send(JSON.stringify({ type: "inject_scenario", scenario_id: scenarioId }));
-  };
-
-  // One-click guided demo: customer turn → staff reply → bilingual summary.
-  const [guidedRunning, setGuidedRunning] = useState(false);
-  const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-  const runGuidedDemo = async () => {
-    if (guidedRunning) return;
-    setGuidedRunning(true);
-    try {
-      if (!connected) {
-        await startSession();
-        await wait(900);
-      }
-      addToast("Step 1 — customer speaks (Gujarati)", "info");
-      injectScenario("loan_enquiry_gu");
-      await wait(2200);
-      addToast("Step 2 — staff replies (translated + spoken)", "info");
-      const reply = "I will help you with the loan enquiry. The indicative EMI for five lakh over 5 years is around ₹10,624.";
-      setStaffText(reply);
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: "staff_speak", text: reply, target_lang: "gu", gender: "female" }));
-      }
-      await wait(2800);
-      addToast("Step 3 — generating bilingual summary", "info");
-      await genSummary();
-    } finally {
-      setGuidedRunning(false);
-    }
-  };
 
   const apiOffline = health?.status !== "ok";
 
@@ -902,6 +865,7 @@ export default function App() {
             <strong>{staffName}</strong>
             <span>{staffRole === "admin" ? "Branch admin" : "Branch staff"}</span>
           </div>
+          <ThemeToggle />
           <button type="button" className="profile-signout" onClick={() => void staffSignOut()} title="Sign out">⏻</button>
         </div>
       </aside>
@@ -985,15 +949,6 @@ export default function App() {
           </div>
 
           <div className="topbar-actions">
-            <button
-              type="button"
-              className="secondary"
-              onClick={() => void runGuidedDemo()}
-              disabled={guidedRunning}
-              title="Auto-plays a sample conversation"
-            >
-              {guidedRunning ? "Running…" : "🎬 Demo"}
-            </button>
             {!sessionId && (
               <button type="button" onClick={() => void startSession()} disabled={sessionLoading}>
                 {sessionLoading ? "Starting…" : "▶ Start session"}
@@ -1001,7 +956,7 @@ export default function App() {
             )}
             {sessionId && (
               <button type="button" className="danger" onClick={() => void endSession()}>
-                End
+                End session
               </button>
             )}
           </div>
@@ -1066,28 +1021,6 @@ export default function App() {
                 </svg>
                 <span>{listening ? "Listening… tap to stop" : `Listen (${customerLangLabel})`}</span>
               </button>
-              <div className="convo-fallback">
-                <input
-                  value={customerTextInput}
-                  onChange={(e) => setCustomerTextInput(e.target.value)}
-                  placeholder={`Or type what customer said in ${customerLangLabel}…`}
-                  disabled={!connected}
-                  onKeyDown={(e) => { if (e.key === "Enter") sendCustomerText(); }}
-                />
-                <button type="button" className="secondary" onClick={sendCustomerText} disabled={!connected || !customerTextInput.trim()}>Send</button>
-              </div>
-              {!!scenarios.length && (
-                <div className="convo-scenarios">
-                  {scenarios.map((s) => {
-                    const pretty = s.replace(/_/g, " ").replace(/\b(gu|hi|ta|te|kn|ml|bn|mr|pa|or|en)\b/i, (m) => m.toUpperCase());
-                    return (
-                      <button key={s} type="button" className="strip-chip" onClick={() => injectScenario(s)} disabled={!connected}>
-                        ▸ {pretty}
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
             </div>
           </section>
 

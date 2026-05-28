@@ -21,7 +21,7 @@ from app.db import SessionLocal, get_db, init_db
 from app.models import AuditEvent, DeskSessionRow, InteractionRecord, User
 from app.routers.auth import ensure_seed_admin, router as auth_router
 from app.services.bhashini_client import BhashiniError, bhashini
-from app.services.demo_oracle import SCENARIO_LINES, demo_translate
+from app.services.demo_oracle import demo_translate  # noqa: F401  (used as silent fallback in fast_mt)
 from app.services.disclaimers import disclaimers_for_intent
 from app.services.fast_mt import fast_translate
 from app.services.glossary import find_terms_in_text
@@ -65,15 +65,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(auth_router)
-
-# Demo replay lines — hackathon-friendly (no audio needed).
-# Source of truth lives in demo_oracle.SCENARIO_LINES so the offline translator
-# can pair the line with its pre-translated counterpart.
-SCENARIOS: dict[str, dict[str, Any]] = {
-    sid: {"customer_lang": sc["customer_lang"], "lines": [sc["original"]]}
-    for sid, sc in SCENARIO_LINES.items()
-}
-
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
@@ -142,7 +133,6 @@ async def create_session(
     return {
         "session_id": sess.session_id,
         "policy": "persisted_with_pii_redaction",
-        "scenarios": list(SCENARIOS.keys()),
     }
 
 
@@ -639,7 +629,6 @@ async def desk_ws(
                 "customer_lang": sess.customer_lang,
                 "staff_lang": sess.staff_lang,
                 "user": {"email": user.email, "role": user.role, "full_name": user.full_name},
-                "scenarios": list(SCENARIOS.keys()),
                 "features": [
                     "realtime_asr_nmt_bhashini",
                     "groq_or_openai_banking_llm",
@@ -651,7 +640,6 @@ async def desk_ws(
                     "real_auth_jwt_roles",
                     "persistent_session_with_redaction",
                     "prompt_sanitization",
-                    "scenario_replay",
                     "agent_guidelines",
                 ],
             }
@@ -764,25 +752,6 @@ async def desk_ws(
                         logger.warning("staff partial translate failed: %s", e)
 
                 state["task"] = asyncio.create_task(_staff_translate_and_emit(t))
-
-            elif mtype == "inject_scenario":
-                sid = str(msg.get("scenario_id") or "")
-                scenario = SCENARIOS.get(sid)
-                if not scenario:
-                    await websocket.send_json({"type": "error", "message": f"unknown_scenario:{sid}"})
-                    continue
-                line = str((scenario.get("lines") or [""])[0])
-                cl = str(scenario.get("customer_lang") or sess.customer_lang)
-                prev = sess.customer_lang
-                sess.customer_lang = cl
-                # Use fast_translate which handles Bhashini → LLM → demo oracle
-                # fallback chain, so the staff always sees a clean translation.
-                if cl == sess.staff_lang:
-                    translated = line
-                else:
-                    translated, _engine = await fast_translate(line, cl, sess.staff_lang)
-                await _finalize_customer_turn(sess, line, translated, 0.95)
-                sess.customer_lang = prev
 
             elif mtype == "customer_audio_wav":
                 b64 = msg.get("base64", "")

@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 
+// Bumped storage key so old "dark" preferences from previous builds are
+// ignored — light theme becomes the default for everyone on first load.
+const THEME_KEY = "fd-theme-v2";
+
 function getStoredTheme(): "light" | "dark" {
-  const stored = localStorage.getItem("fd-theme");
+  const stored = localStorage.getItem(THEME_KEY);
   if (stored === "dark" || stored === "light") return stored;
   return "light";
 }
@@ -11,7 +15,7 @@ export function ThemeToggle() {
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
-    localStorage.setItem("fd-theme", theme);
+    localStorage.setItem(THEME_KEY, theme);
   }, [theme]);
 
   const toggle = useCallback(() => {
