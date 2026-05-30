@@ -20,10 +20,9 @@ from app.config import get_settings
 from app.db import SessionLocal, get_db, init_db
 from app.models import AuditEvent, DeskSessionRow, InteractionRecord, User
 from app.routers.auth import ensure_seed_admin, router as auth_router
-from app.services.bhashini_client import BhashiniError, bhashini
-from app.services.demo_oracle import demo_translate  # noqa: F401  (used as silent fallback in fast_mt)
+from app.routers.live import router as live_router
 from app.services.disclaimers import disclaimers_for_intent
-from app.services.fast_mt import fast_translate
+from app.services.fast_mt import detect_language, fast_translate
 from app.services.glossary import find_terms_in_text
 from app.services.llm_bank import (
     bilingual_summary,
@@ -52,7 +51,7 @@ async def lifespan(app: FastAPI):
             password=s.seed_admin_password,
             name=s.seed_admin_name,
         )
-    logger.info("DB ready; LLM provider=%s", get_settings().llm_provider)
+    logger.info("DB ready; AI provider=Gemini")
     yield
 
 
@@ -65,6 +64,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(auth_router)
+app.include_router(live_router)
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
@@ -72,17 +72,15 @@ async def health() -> dict[str, Any]:
     api_key, _, model = s.llm_effective
     return {
         "status": "ok",
-        "bhashini_configured": bool(s.bhashini_user_id and s.bhashini_ulca_api_key),
-        "llm_provider": s.llm_provider,
-        "llm_model": model,
-        "llm_configured": bool(api_key),
+        "ai_provider": "gemini",
+        "gemini_model": model,
+        "gemini_configured": bool(api_key),
         "demo_mode": s.demo_mode,
         "auth": "jwt_required",
         "features": [
             "real_auth_jwt_roles",
             "postgres_or_sqlite_persistence",
-            "bhashini_asr_nmt_tts",
-            "groq_or_openai_llm",
+            "gemini_llm_and_translation",
             "smart_form_autofill",
             "bilingual_records",
             "pii_redaction_governance",
@@ -431,6 +429,50 @@ async def _persist_turn(session_id: str, turn_payload: dict[str, Any]) -> None:
         logger.warning("turn persist failed: %s", e)
 
 
+async def _finalize_staff_turn(
+    sess: Any,
+    text_original: str,
+    text_translated: str,
+) -> None:
+    turn = ConversationTurn(
+        role="staff",
+        source_lang=sess.staff_lang,
+        text_original=text_original,
+        text_translated=text_translated,
+        confidence=1.0,
+    )
+    sess.turns.append(turn)
+    sess.metrics.staff_turns += 1
+    sess.log_audit("staff_turn", {"chars": len(text_original)})
+
+    await _persist_turn(
+        sess.session_id,
+        {
+            "role": "staff",
+            "source_lang": sess.staff_lang,
+            "text_original": text_original,
+            "text_translated": text_translated,
+            "confidence": 1.0,
+            "ts": turn.ts,
+        },
+    )
+
+    ws = sess.ws
+    if ws is not None:
+        try:
+            await ws.send_json(
+                {
+                    "type": "transcript",
+                    "role": "staff",
+                    "source_lang": sess.staff_lang,
+                    "text_original": text_original,
+                    "text_translated": text_translated,
+                }
+            )
+        except Exception:
+            pass
+
+
 async def _finalize_customer_turn(
     sess: Any,
     text_original: str,
@@ -541,31 +583,11 @@ async def _process_customer_audio(
     audio_format: str,
     sample_rate: int,
 ) -> None:
-    s = get_settings()
-    transcript = ""
-    translated = ""
-    api_c: float | None = None
-
-    if s.demo_mode or not (s.bhashini_user_id and s.bhashini_ulca_api_key):
-        # No server-side ASR engine configured. The browser Web Speech API
-        # handles live mic ASR and sends `customer_text` finals, so raw audio
-        # chunks have nothing to transcribe here. Stay silent rather than
-        # spamming a placeholder turn for every chunk.
-        return
-    else:
-        try:
-            transcript, translated, api_c = await bhashini.asr_and_translate(
-                source_lang=sess.customer_lang,
-                target_lang=sess.staff_lang,
-                audio_bytes=audio_bytes,
-                audio_format=audio_format,
-                sampling_rate=sample_rate,
-            )
-        except BhashiniError as e:
-            logger.warning("Bhashini ASR failed: %s", e)
-            sess.metrics.bhashini_errors += 1
-            transcript = ""
-            translated = f"[Bhashini error] {e}"
+    # Live ASR is handled by the browser's Web Speech API (Chrome) for the best zero-config experience.
+    # Raw audio chunks are ignored or could be bridged to Gemini Multimodal in the future.
+    transcript = "[Tip] Use Chrome's mic for live ASR, or pick a scenario."
+    translated = transcript
+    api_c = 0.4
 
     if transcript or translated:
         await _finalize_customer_turn(sess, transcript or translated, translated or transcript, api_c)
@@ -629,10 +651,10 @@ async def desk_ws(
                 "staff_lang": sess.staff_lang,
                 "user": {"email": user.email, "role": user.role, "full_name": user.full_name},
                 "features": [
-                    "realtime_asr_nmt_bhashini",
-                    "groq_or_openai_banking_llm",
+                    "realtime_translation_gemini",
+                    "gemini_banking_llm",
                     "confidence_disambiguation_disclaimers",
-                    "staff_tts_customer_language",
+                    "browser_tts_customer_language",
                     "smart_form_autofill",
                     "bilingual_summary_quotes",
                     "glossary_risk_normalize",
@@ -771,11 +793,43 @@ async def desk_ws(
                 if not raw:
                     continue
                 lang = msg.get("lang") or sess.customer_lang
+                
+                # Auto-detect language if none is selected
+                if lang == "none" or sess.customer_lang == "none":
+                    detected = await detect_language(raw)
+                    sess.customer_lang = detected
+                    lang = detected
+                    # Save detected language to DB
+                    async with SessionLocal() as db:
+                        from sqlalchemy import update
+                        await db.execute(
+                            update(DeskSessionRow)
+                            .where(DeskSessionRow.id == sess.session_id)
+                            .values(customer_lang=detected)
+                        )
+                        await db.commit()
+                    # Broadcast update to frontend
+                    await websocket.send_json({
+                        "type": "language_detected",
+                        "customer_lang": detected
+                    })
+
                 if lang == sess.staff_lang:
                     translated = raw
                 else:
                     translated, _engine = await fast_translate(raw, lang, sess.staff_lang)
                 await _finalize_customer_turn(sess, raw, translated, 0.99)
+                
+                # Generate voice output (TTS fallback) for the staff in their desired language
+                sess.metrics.tts_playouts += 1
+                await websocket.send_json(
+                    {
+                        "type": "tts_fallback",
+                        "lang": sess.staff_lang,
+                        "text": translated,
+                        "reason": "browser_native_tts",
+                    }
+                )
 
             elif mtype == "staff_speak":
                 raw_text = (msg.get("text") or "").strip()
@@ -783,7 +837,7 @@ async def desk_ws(
                 if not text:
                     continue
                 target = msg.get("target_lang") or sess.customer_lang
-                # Translation chain: Bhashini → LLM → offline demo phrasebook.
+                # Translation chain: Gemini → offline demo phrasebook.
                 if target == sess.staff_lang:
                     cust_text = text
                 else:
@@ -820,26 +874,6 @@ async def desk_ws(
                     }
                 )
                 tts_done = False
-                if get_settings().bhashini_user_id and get_settings().bhashini_ulca_api_key:
-                    try:
-                        audio = await bhashini.tts(
-                            lang=target,
-                            text=cust_text,
-                            gender=msg.get("gender") or "female",
-                        )
-                        sess.metrics.tts_playouts += 1
-                        await websocket.send_json(
-                            {
-                                "type": "tts_audio",
-                                "lang": target,
-                                "mime": "audio/wav",
-                                "base64": base64.b64encode(audio).decode("ascii"),
-                                "barge_in_hint": "Start listening to interrupt playback",
-                            }
-                        )
-                        tts_done = True
-                    except BhashiniError as e:
-                        await websocket.send_json({"type": "tts_error", "message": str(e)})
                 if not tts_done:
                     # Browser speechSynthesis fallback — the frontend speaks the
                     # translated text locally. This keeps the demo audible without
@@ -850,7 +884,7 @@ async def desk_ws(
                             "type": "tts_fallback",
                             "lang": target,
                             "text": cust_text,
-                            "reason": "no_external_tts_configured",
+                            "reason": "browser_native_tts",
                         }
                     )
 
@@ -897,3 +931,4 @@ async def desk_ws(
         except Exception:  # noqa: BLE001
             pass
         store.delete(session_id)
+

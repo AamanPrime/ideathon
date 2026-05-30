@@ -22,7 +22,6 @@ class SessionMetrics:
     customer_turns: int = 0
     staff_turns: int = 0
     low_confidence_segments: int = 0
-    bhashini_errors: int = 0
     tts_playouts: int = 0
 
 
@@ -76,7 +75,6 @@ class DeskSession:
             "customer_turns": self.metrics.customer_turns,
             "staff_turns": self.metrics.staff_turns,
             "low_confidence_segments": self.metrics.low_confidence_segments,
-            "bhashini_errors": self.metrics.bhashini_errors,
             "tts_playouts": self.metrics.tts_playouts,
             "approx_handling_index": round(turns / max(d / 60.0, 0.01), 2),
         }

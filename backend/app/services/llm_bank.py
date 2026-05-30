@@ -5,16 +5,15 @@ import logging
 import re
 from typing import Any
 
-from openai import AsyncOpenAI
+from google.genai import types
 
 from app.config import get_settings
-from app.services.banking_finetune_prompts import BANKING_JSON_FEW_SHOTS
+from app.services.vertex_client import get_vertex_client
 from app.services.demo_oracle import (
     demo_enrich,
     demo_form_extract,
     demo_summary,
 )
-from app.services.gemini_client import gemini_json
 from app.services.safety import sanitize_for_llm
 
 logger = logging.getLogger(__name__)
@@ -30,7 +29,7 @@ Rules:
 - Support Hindi-English or other code-mixed Indian conversation; infer intent from mixed text.
 - Prefer RBI / IBA-aligned language; when unsure, choose conservative disclosure and escalation hints.
 
-""" + BANKING_JSON_FEW_SHOTS
+"""
 
 PAN_RE = re.compile(r"\b[A-Z]{5}[0-9]{4}[A-Z]\b")
 AADHAAR_RE = re.compile(r"\b\d{4}\s?\d{4}\s?\d{4}\b")
@@ -68,44 +67,24 @@ async def banking_json_completion(
     user_prompt: str,
     schema_hint: str,
 ) -> dict[str, Any]:
-    """Call the configured LLM (Groq, OpenAI-compatible, or mock) for a JSON banking answer.
-
-    Provider selection comes from settings.llm_provider (groq | openai | mock).
-    Both Groq and OpenAI expose an OpenAI-compatible Chat Completions endpoint,
-    so a single AsyncOpenAI client + a different base_url is all that's needed.
-    """
-    s = get_settings()
-    api_key, base_url, model = s.llm_effective
-    if not api_key or not model:
-        # No OpenAI/Groq LLM configured. Use Gemini for real banking JSON when
-        # available; otherwise the caller falls back to the offline oracle.
-        if s.gemini_enabled:
-            return await gemini_json(
-                system=BANKING_SYSTEM,
-                user_prompt=sanitize_for_llm(user_prompt),
-                schema_hint=schema_hint,
-            )
-        return {}
-
+    """Call Vertex AI gemini-2.5-flash for a JSON banking answer."""
     safe_prompt = sanitize_for_llm(user_prompt)
-    client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+    client = get_vertex_client()
     try:
-        resp = await client.chat.completions.create(
-            model=model,
-            temperature=0.2,
-            messages=[
-                {"role": "system", "content": BANKING_SYSTEM},
-                {
-                    "role": "user",
-                    "content": f"{schema_hint}\n\n{safe_prompt}",
-                },
-            ],
+        resp = await client.aio.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=f"{schema_hint}\n\n{safe_prompt}",
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                system_instruction=BANKING_SYSTEM,
+                response_mime_type="application/json"
+            )
         )
-        raw = (resp.choices[0].message.content or "").strip()
+        raw = (resp.text or "").strip()
         raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         return json.loads(raw)
     except Exception as e:  # noqa: BLE001
-        logger.warning("LLM completion failed (%s): %s", s.llm_provider, e)
+        logger.warning("Vertex Gemini completion failed: %s", e)
         return {}
 
 

@@ -6,7 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    app_name: str = "Frontline Desk Voice Assistant"
+    app_name: str = "Frontline Desk Voice Assistant (Gemini Edition)"
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
     # --- Database ---
@@ -20,31 +20,18 @@ class Settings(BaseSettings):
     seed_admin_password: str = "ChangeMe!123"
     seed_admin_name: str = "Branch Admin"
 
-    # Bhashini / ULCA — https://bhashini.gitbook.io/bhashini-apis/
-    bhashini_user_id: str = ""
-    bhashini_ulca_api_key: str = ""
-    bhashini_pipeline_config_url: str = "https://meity-auth.ulcacontrib.org/ulca/apis/v0/model/getModelsPipeline"
-
-    # --- LLM (swappable: openai | groq | mock) ---
-    llm_provider: str = "mock"
-
-    # Groq (OpenAI-compatible)
-    groq_api_key: str = ""
-    groq_model: str = "llama-3.3-70b-versatile"
-    groq_base_url: str = "https://api.groq.com/openai/v1"
-
-    # OpenAI-compatible
-    llm_api_key: str = ""
-    llm_base_url: str = "https://api.openai.com/v1"
-    llm_model: str = "gpt-4o-mini"
-
-    # --- Google Gemini (real-time native audio) ---
+    # --- Gemini (primary AI provider) ---
+    # Text translation / enrichment go through the OpenAI-compatible endpoint.
     gemini_api_key: str = ""
     gemini_model: str = "gemini-live-2.5-flash-native-audio"
-    # Path to the Google Cloud service-account JSON (gitignored). Used for
-    # Vertex/Speech fallbacks; the Live API uses GEMINI_API_KEY directly.
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+    # --- Vertex AI Live (real-time native audio) ---
+    # Path to the Google Cloud service-account JSON (gitignored, never committed).
+    # The Live router authenticates to Vertex AI with these credentials.
     google_application_credentials: str = "gcp_service_account.json"
-    gemini_project_id: str = ""
+    gemini_project_id: str = "annular-form-477012-i9"
+    vertex_location: str = "us-central1"
 
     # Demo / resilience
     demo_mode: bool = False
@@ -59,13 +46,15 @@ class Settings(BaseSettings):
 
     @property
     def llm_effective(self) -> tuple[str, str, str]:
-        """Return (api_key, base_url, model) for the active LLM provider, or empty key for mock."""
-        p = (self.llm_provider or "mock").lower()
-        if p == "groq":
-            return self.groq_api_key, self.groq_base_url, self.groq_model
-        if p == "openai":
-            return self.llm_api_key, self.llm_base_url, self.llm_model
-        return "", "", ""
+        """Return (api_key, base_url, model) for Gemini's OpenAI-compatible text API.
+
+        The Live native-audio model can't serve text generateContent, so map it
+        to a fast text model for translation / enrichment.
+        """
+        model = self.gemini_model
+        if "live" in model or "audio" in model:
+            model = "gemini-2.0-flash"
+        return self.gemini_api_key, self.gemini_base_url, model
 
 
 @lru_cache
