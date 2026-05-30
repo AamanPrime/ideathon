@@ -347,7 +347,9 @@ export default function App() {
     }, 400);
   };
 
-  const startSession = async () => {
+  const startSession = async (override?: { cust?: string; staff?: string }) => {
+    const cLang = override?.cust ?? customerLang;
+    const sLang = override?.staff ?? staffLang;
     setSessionLoading(true);
     setLines([]);
     setForm({});
@@ -359,8 +361,8 @@ export default function App() {
     const r = await apiFetch(`/session`, {
       method: "POST",
       body: JSON.stringify({
-        customer_lang: customerLang,
-        staff_lang: staffLang,
+        customer_lang: cLang,
+        staff_lang: sLang,
         customer_ref: servingCustomerRef.trim(),
       }),
     });
@@ -449,6 +451,21 @@ export default function App() {
     setListening(false);
     await micRef.current?.stop();
     micRef.current = null;
+  };
+
+  // Change customer/staff language. A session is bound to its languages at
+  // creation, so if one is live we transparently restart it with the new pair.
+  const switchLang = async (which: "cust" | "staff", value: string) => {
+    if (which === "cust") setCustomerLang(value);
+    else setStaffLang(value);
+    if (sessionId || connected) {
+      await endSession();
+      autoStartRef.current = true; // we restart manually below; don't double-fire the auto effect
+      await startSession({
+        cust: which === "cust" ? value : customerLang,
+        staff: which === "staff" ? value : staffLang,
+      });
+    }
   };
 
   // Auto-start a session as soon as we're logged in, so the chat is ready.
@@ -938,9 +955,9 @@ export default function App() {
               <span>Customer</span>
               <select
                 value={customerLang}
-                onChange={(e) => setCustomerLang(e.target.value)}
-                disabled={connected}
-                title={connected ? "End the session to change language" : "Pick the customer's language"}
+                onChange={(e) => void switchLang("cust", e.target.value)}
+                disabled={sessionLoading}
+                title="Pick the customer's language (restarts the session)"
               >
                 {CUSTOMER_LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
               </select>
@@ -948,7 +965,11 @@ export default function App() {
             <span className="lang-swap" aria-hidden>⇄</span>
             <label>
               <span>Staff</span>
-              <select value={staffLang} onChange={(e) => setStaffLang(e.target.value)} disabled={connected}>
+              <select
+                value={staffLang}
+                onChange={(e) => void switchLang("staff", e.target.value)}
+                disabled={sessionLoading}
+              >
                 {STAFF_LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
               </select>
             </label>
