@@ -547,12 +547,11 @@ async def _process_customer_audio(
     api_c: float | None = None
 
     if s.demo_mode or not (s.bhashini_user_id and s.bhashini_ulca_api_key):
-        # No live ASR keys — surface a tip instead of a confusing line.
-        # In Chrome the browser-side Web Speech API handles live mic ASR, so
-        # this path is only reached from raw audio chunks (not browser-finals).
-        transcript = "[Tip] Use Chrome's mic for live ASR, or pick a scenario / type the customer's words."
-        translated = transcript
-        api_c = 0.4
+        # No server-side ASR engine configured. The browser Web Speech API
+        # handles live mic ASR and sends `customer_text` finals, so raw audio
+        # chunks have nothing to transcribe here. Stay silent rather than
+        # spamming a placeholder turn for every chunk.
+        return
     else:
         try:
             transcript, translated, api_c = await bhashini.asr_and_translate(

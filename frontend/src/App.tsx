@@ -472,18 +472,24 @@ export default function App() {
     }
     stopPlayback();
     const ws = wsRef.current;
-    const cap = new MicCapture((b64) => {
-      ws.send(
-        JSON.stringify({
-          type: "customer_audio_wav",
-          base64: b64,
-          format: "wav",
-          sample_rate: 16000,
-        })
-      );
-    }, 2400);
-    micRef.current = cap;
-    await cap.start();
+    // When the browser Web Speech API is available (Chrome), it does live ASR
+    // and emits `customer_text` finals — the real-time path. Streaming raw
+    // audio chunks on top of that is redundant (the backend has no server-side
+    // ASR), so we only fall back to MicCapture when Web Speech is unavailable.
+    if (!getSpeechRecognition()) {
+      const cap = new MicCapture((b64) => {
+        ws.send(
+          JSON.stringify({
+            type: "customer_audio_wav",
+            base64: b64,
+            format: "wav",
+            sample_rate: 16000,
+          })
+        );
+      }, 2400);
+      micRef.current = cap;
+      await cap.start();
+    }
     setListening(true);
   };
 
