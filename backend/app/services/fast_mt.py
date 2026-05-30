@@ -1,29 +1,23 @@
-"""Low-latency translation for live captions.
+"""Low-latency translation for live captions using Gemini.
 
 Strategy (first hit wins):
-  1. Bhashini ULCA NMT — when credentials are configured (production path).
-  2. MyMemory public translation API — no key required, generous free tier,
-     covers all Indic↔English pairs we need.
-  3. Configured LLM (Groq for sub-second latency on llama-3.x) — last resort
-     when MyMemory throttles or errors.
-  4. Offline demo phrasebook — guarantees the demo never goes silent.
+  1. Configured Gemini API (via OpenAI-compatible endpoint).
+  2. Offline demo phrasebook — guarantees the demo never goes silent.
 
 Includes a small per-(source,target) cache so repeated partials don't re-call.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
 from typing import Optional
 
-import httpx
-from openai import AsyncOpenAI
+from google.genai import types
 
 from app.config import get_settings
-from app.services.bhashini_client import BhashiniError, bhashini
 from app.services.demo_oracle import demo_translate
+from app.services.vertex_client import get_vertex_client
 
 logger = logging.getLogger(__name__)
 
@@ -52,90 +46,72 @@ def _cache_put(key: tuple[str, str, str], value: str) -> None:
     _cache[key] = (value, time.time())
 
 
-async def _mymemory_translate(text: str, source_lang: str, target_lang: str) -> str:
-    """Public free translation API — no auth required.
-
-    Quota is 5000 chars/day/IP (50k with a contact email). For a branch desk
-    demo this is essentially unlimited. Returns empty string on error so the
-    caller can fall back to the next layer.
-    """
-    if not text:
-        return ""
-    pair = f"{source_lang}|{target_lang}"
-    try:
-        async with httpx.AsyncClient(timeout=4.0) as client:
-            r = await client.get(
-                "https://api.mymemory.translated.net/get",
-                params={"q": text, "langpair": pair},
-            )
-            if r.status_code >= 400:
-                return ""
-            data = r.json()
-        if int(data.get("responseStatus", 0)) != 200:
-            return ""
-        translated = (data.get("responseData") or {}).get("translatedText") or ""
-        translated = translated.strip()
-        # MyMemory occasionally echoes the source verbatim when it can't
-        # translate — treat that as a miss.
-        if not translated or translated.strip().lower() == text.strip().lower():
-            return ""
-        # Some responses prepend "MYMEMORY WARNING" — drop those.
-        if translated.upper().startswith("MYMEMORY WARNING"):
-            return ""
-        return translated
-    except Exception as e:  # noqa: BLE001
-        logger.info("MyMemory translate failed: %s", e)
-        return ""
-
-
 async def _llm_translate(text: str, source_lang: str, target_lang: str) -> str:
-    """Tight LLM-based translation. Used as a fast fallback when Bhashini text NMT is unavailable.
-
-    Groq's llama-3.x typically returns < 700ms for short text, which is the budget for a "live caption".
-    """
-    s = get_settings()
-    api_key, base_url, model = s.llm_effective
-    if not api_key or not model:
-        return text
-
-    client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+    """Tight Vertex AI-based translation using gemini-2.5-flash."""
+    client = get_vertex_client()
     try:
-        resp = await client.chat.completions.create(
-            model=model,
-            temperature=0.0,
-            max_tokens=256,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a high-speed translator for a real-time banking caption."
-                        " Translate the user's text from the source language to the target language."
-                        " Output ONLY the translated text — no quotes, no preamble, no explanations."
-                        " Preserve numbers, INR amounts (₹), account numbers and identifiers verbatim."
-                        " If the input is already in the target language, return it unchanged."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {"source_lang": source_lang, "target_lang": target_lang, "text": text},
-                        ensure_ascii=False,
-                    ),
-                },
-            ],
+        resp = await client.aio.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=json.dumps(
+                {"source_lang": source_lang, "target_lang": target_lang, "text": text},
+                ensure_ascii=False,
+            ),
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                max_output_tokens=256,
+                system_instruction=(
+                    "You are a high-speed translator for a real-time banking caption."
+                    " Translate the user's text from the source language to the target language."
+                    " Output ONLY the translated text — no quotes, no preamble, no explanations."
+                    " Preserve numbers, INR amounts (₹), account numbers and identifiers verbatim."
+                    " If the input is already in the target language, return it unchanged."
+                )
+            )
         )
-        out = (resp.choices[0].message.content or "").strip()
+        out = (resp.text or "").strip()
         # Defensive: strip stray quotes/backticks the model sometimes emits.
         return out.strip("`\"' \n")
     except Exception as e:  # noqa: BLE001
-        logger.warning("fast LLM MT failed: %s", e)
+        logger.warning("fast Vertex MT failed: %s", e)
         return text
 
 
-async def fast_translate(text: str, source_lang: str, target_lang: str) -> tuple[str, str]:
-    """Translate `text` with the lowest available latency.
+async def detect_language(text: str) -> str:
+    """Detects the ISO-639-1 language code (e.g. 'hi', 'gu', 'ta', 'en') of text using Vertex AI."""
+    text = (text or "").strip()
+    if not text:
+        return "hi"  # Default fallback
 
-    Returns (translated_text, engine_used) where engine ∈ {"bhashini", "llm", "noop"}.
+    client = get_vertex_client()
+    try:
+        resp = await client.aio.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=text,
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                max_output_tokens=10,
+                system_instruction=(
+                    "You are an expert language detector."
+                    " Detect the language of the user's text and output ONLY its ISO 639-1 two-letter code (e.g., 'hi' for Hindi, 'gu' for Gujarati, 'ta' for Tamil, 'te' for Telugu, 'kn' for Kannada, 'ml' for Malayalam, 'mr' for Marathi, 'bn' for Bengali, 'pa' for Punjabi, 'or' for Odia, 'en' for English)."
+                    " Output absolutely nothing else — no explanations, no quotes, just the two letter code."
+                )
+            )
+        )
+        out = (resp.text or "").strip().lower()
+        out = out.strip("`\"' \n")
+        if len(out) >= 2:
+            return out[:2]
+        return "hi"
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Vertex language detection failed: %s", e)
+        return "hi"
+
+
+
+async def fast_translate(text: str, source_lang: str, target_lang: str) -> tuple[str, str]:
+    """Translate `text` with the lowest available latency using Gemini.
+
+    Returns (translated_text, engine_used) where engine ∈ {"gemini", "noop"}.
     Same-language pass-through is a no-op.
     """
     text = (text or "").strip()
@@ -149,35 +125,13 @@ async def fast_translate(text: str, source_lang: str, target_lang: str) -> tuple
     if cached is not None:
         return cached, "cache"
 
-    s = get_settings()
-    has_bhashini = bool(s.bhashini_user_id and s.bhashini_ulca_api_key)
-
-    # 1. Bhashini first when configured (matches the production pipeline).
-    if has_bhashini:
-        try:
-            translated = await asyncio.wait_for(
-                bhashini.translate_text(source_lang=source_lang, target_lang=target_lang, text=text),
-                timeout=2.5,
-            )
-            if translated and translated.strip():
-                _cache_put(key, translated)
-                return translated, "bhashini"
-        except (BhashiniError, asyncio.TimeoutError) as e:
-            logger.info("fast_translate: Bhashini fallback (%s)", e)
-
-    # 2. MyMemory public API — real translation, no key needed.
-    translated = await _mymemory_translate(text, source_lang, target_lang)
-    if translated and translated != text:
-        _cache_put(key, translated)
-        return translated, "mymemory"
-
-    # 3. Configured LLM (Groq / OpenAI-compatible).
+    # Gemini-based translation
     translated = await _llm_translate(text, source_lang, target_lang)
     if translated and translated != text:
         _cache_put(key, translated)
-        return translated, "llm"
+        return translated, "gemini"
 
-    # 4. Offline phrasebook — guarantees demo never goes silent.
+    # Offline phrasebook — guarantees demo never goes silent.
     demo = demo_translate(text, source_lang, target_lang)
     if demo and demo != text:
         _cache_put(key, demo)

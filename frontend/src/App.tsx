@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MicCapture } from "./audio/capture";
+import { LiveMicCapture } from "./audio/liveCapture";
+import { LiveAudioPlayer } from "./audio/livePlayer";
 import { appendHistory, loadHistory, type CustomerHistoryItem } from "./customerHistory";
 import Login from "./Login";
 import History from "./History";
@@ -19,6 +21,7 @@ type Portal = "gate" | "staff-login" | "customer-login" | "customer-kiosk" | "de
 type LangOption = { code: string; label: string };
 
 const CUSTOMER_LANGS: LangOption[] = [
+  { code: "none", label: "Auto-Detect (None)" },
   { code: "gu", label: "Gujarati" },
   { code: "hi", label: "Hindi" },
   { code: "ta", label: "Tamil" },
@@ -33,8 +36,17 @@ const CUSTOMER_LANGS: LangOption[] = [
 ];
 
 const STAFF_LANGS: LangOption[] = [
-  { code: "en", label: "English (staff)" },
+  { code: "gu", label: "Gujarati (staff)" },
   { code: "hi", label: "Hindi (staff)" },
+  { code: "ta", label: "Tamil (staff)" },
+  { code: "te", label: "Telugu (staff)" },
+  { code: "kn", label: "Kannada (staff)" },
+  { code: "ml", label: "Malayalam (staff)" },
+  { code: "mr", label: "Marathi (staff)" },
+  { code: "bn", label: "Bengali (staff)" },
+  { code: "pa", label: "Punjabi (staff)" },
+  { code: "or", label: "Odia (staff)" },
+  { code: "en", label: "English (staff)" },
 ];
 
 const BCP47: Record<string, string> = {
@@ -91,7 +103,7 @@ export default function App() {
   const [kioskHistory, setKioskHistory] = useState<CustomerHistoryItem[]>([]);
   const [servingCustomerRef] = useState("");
 
-  const [customerLang, setCustomerLang] = useState("gu");
+  const [customerLang, setCustomerLang] = useState("none");
   const [staffLang, setStaffLang] = useState("en");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
@@ -114,6 +126,12 @@ export default function App() {
   const [sessionLoading, setSessionLoading] = useState(false);
   const [summaryLoading, setSummaryLoading] = useState(false);
 
+  // Gemini Live state
+  const [geminiLiveConnected, setGeminiLiveConnected] = useState(false);
+  const geminiWsRef = useRef<WebSocket | null>(null);
+  const geminiMicRef = useRef<LiveMicCapture | null>(null);
+  const geminiPlayerRef = useRef<LiveAudioPlayer>(new LiveAudioPlayer());
+
   const [privacyRedact] = useState(false);
   const [fontScale] = useState("1");
   const [highContrast] = useState(false);
@@ -127,6 +145,10 @@ export default function App() {
   const micRef = useRef<MicCapture | null>(null);
   const currentAudioRef = useRef<HTMLAudioElement | null>(null);
   const speechRef = useRef<SpeechRecognition | null>(null);
+  const [staffListening, setStaffListening] = useState(false);
+  const [isSpeechPlaying, setIsSpeechPlaying] = useState(false);
+  const staffSpeechRef = useRef<SpeechRecognition | null>(null);
+  const [geminiLivePlaying, setGeminiLivePlaying] = useState(false);
 
   const addToast = useCallback((msg: string, type: "info" | "error" | "ok" = "info") => {
     const id = ++toastIdRef.current;
@@ -188,10 +210,15 @@ export default function App() {
     } catch {
       /* noop */
     }
+    if ("speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+    }
+    setIsSpeechPlaying(false);
   };
 
   useEffect(() => {
-    if (!listening || !connected || !useBrowserPartial) {
+    // Skip old SpeechRecognition pipeline when Gemini Live is handling audio
+    if (!listening || !connected || !useBrowserPartial || geminiLiveConnected) {
       speechRef.current?.stop();
       speechRef.current = null;
       setPartialLine("");
@@ -203,7 +230,8 @@ export default function App() {
     speechRef.current = rec;
     rec.continuous = true;
     rec.interimResults = true;
-    rec.lang = BCP47[customerLang] || `${customerLang}-IN`;
+    const effectiveCustomerLang = customerLang === "none" ? "hi" : customerLang;
+    rec.lang = BCP47[effectiveCustomerLang] || `${effectiveCustomerLang}-IN`;
     rec.onresult = (ev: SpeechRecognitionEvent) => {
       let interim = "";
       let final = "";
@@ -240,7 +268,7 @@ export default function App() {
         /* noop */
       }
     };
-  }, [listening, connected, customerLang, useBrowserPartial]);
+  }, [listening, connected, customerLang, useBrowserPartial, geminiLiveConnected]);
 
   useEffect(() => {
     if (!sessionId || !connected) {
@@ -301,8 +329,13 @@ export default function App() {
         u.rate = 0.92;
         u.pitch = 1.0;
         if (voice) u.voice = voice;
+        u.onstart = () => setIsSpeechPlaying(true);
+        u.onend = () => setIsSpeechPlaying(false);
+        u.onerror = () => setIsSpeechPlaying(false);
         synth.speak(u);
-      } catch { /* noop */ }
+      } catch {
+        setIsSpeechPlaying(false);
+      }
     };
     if (synth.getVoices().length === 0) {
       const handler = () => {
@@ -387,6 +420,7 @@ export default function App() {
     ws.onmessage = (ev) => {
       const msg = JSON.parse(ev.data as string);
       if (msg.type === "transcript") {
+        setServerPartial("");
         setLines((prev) => [
           ...prev,
           {
@@ -413,13 +447,18 @@ export default function App() {
       }
       if (msg.type === "tts_fallback") {
         speakLocally(msg.text as string, msg.lang as string);
-        addToast("Speaking in customer language (browser TTS)", "ok");
+        const targetLabel = msg.lang === staffLang ? "staff" : "customer";
+        addToast(`Speaking translation aloud for ${targetLabel}`, "ok");
       }
       if (msg.type === "tts_error") {
         addToast(`TTS error: ${msg.message}`, "error");
       }
       if (msg.type === "staff_partial_translation") {
         setStaffTranslationPreview(msg.text_translated as string || "");
+      }
+      if (msg.type === "language_detected") {
+        setCustomerLang(msg.customer_lang);
+        addToast(`Language Auto-Detected: ${msg.customer_lang.toUpperCase()}`, "ok");
       }
       if (msg.type === "error") {
         addToast(`Error: ${msg.message}`, "error");
@@ -461,30 +500,196 @@ export default function App() {
   }, [authUser]);
 
   const toggleListen = async () => {
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-    if (listening) {
-      stopPlayback();
-      await micRef.current?.stop();
-      micRef.current = null;
+    // Always route through the Gemini Live Translator for real-time translation
+    if (geminiLiveConnected || listening) {
+      // Stop: turn off Gemini Live if active, or old listen if somehow active
+      if (geminiLiveConnected) {
+        await geminiMicRef.current?.stop();
+        geminiMicRef.current = null;
+        geminiPlayerRef.current?.stop();
+        geminiWsRef.current?.close();
+        geminiWsRef.current = null;
+        setGeminiLiveConnected(false);
+        setServerPartial("");
+      }
+      if (listening) {
+        stopPlayback();
+        await micRef.current?.stop();
+        micRef.current = null;
+        setPartialLine("");
+      }
       setListening(false);
-      setPartialLine("");
+      return;
+    }
+    // Start Gemini Live Translator automatically
+    stopPlayback();
+    setListening(true);
+    await toggleGeminiLive();
+  };
+
+  const toggleStaffListen = async () => {
+    // Route staff speech through Gemini Live Translator too
+    if (geminiLiveConnected || staffListening) {
+      if (geminiLiveConnected) {
+        await geminiMicRef.current?.stop();
+        geminiMicRef.current = null;
+        geminiPlayerRef.current?.stop();
+        geminiWsRef.current?.close();
+        geminiWsRef.current = null;
+        setGeminiLiveConnected(false);
+        setServerPartial("");
+      }
+      setStaffListening(false);
       return;
     }
     stopPlayback();
-    const ws = wsRef.current;
-    const cap = new MicCapture((b64) => {
-      ws.send(
-        JSON.stringify({
-          type: "customer_audio_wav",
-          base64: b64,
-          format: "wav",
-          sample_rate: 16000,
-        })
-      );
-    }, 2400);
-    micRef.current = cap;
-    await cap.start();
-    setListening(true);
+    setStaffListening(true);
+    await toggleGeminiLive();
+  };
+
+  useEffect(() => {
+    // Skip old SpeechRecognition pipeline when Gemini Live is handling audio
+    if (!staffListening || !connected || geminiLiveConnected) {
+      staffSpeechRef.current?.stop();
+      staffSpeechRef.current = null;
+      return;
+    }
+    const Ctor = getSpeechRecognition();
+    if (!Ctor) return;
+    const rec = new Ctor();
+    staffSpeechRef.current = rec;
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.lang = BCP47[staffLang] || `${staffLang}-IN`;
+    rec.onresult = (ev: SpeechRecognitionEvent) => {
+      let interim = "";
+      let final = "";
+      for (let i = ev.resultIndex; i < ev.results.length; i++) {
+        const r = ev.results[i];
+        const t = r[0]?.transcript || "";
+        if (r.isFinal) final += t;
+        else interim += t;
+      }
+      const show = final || interim;
+      if (show) {
+        setStaffText(show);
+      }
+      if (final.trim()) {
+        wsRef.current?.send(
+          JSON.stringify({
+            type: "staff_speak",
+            text: final.trim(),
+            target_lang: customerLang,
+          })
+        );
+        setStaffText("");
+        setStaffListening(false);
+      }
+    };
+    rec.onend = () => {
+      setStaffListening(false);
+    };
+    rec.onerror = () => {
+      setStaffListening(false);
+    };
+    try {
+      rec.start();
+    } catch {
+      setStaffListening(false);
+    }
+  }, [staffListening, connected, staffLang, customerLang, geminiLiveConnected]);
+
+  useEffect(() => {
+    if (!geminiLiveConnected) {
+      setGeminiLivePlaying(false);
+      return;
+    }
+    const interval = setInterval(() => {
+      setGeminiLivePlaying(geminiPlayerRef.current?.isPlaying || false);
+    }, 100);
+    return () => clearInterval(interval);
+  }, [geminiLiveConnected]);
+
+  const toggleGeminiLive = async () => {
+    if (geminiLiveConnected) {
+      // Disconnect
+      await geminiMicRef.current?.stop();
+      geminiMicRef.current = null;
+      geminiPlayerRef.current?.stop();
+      geminiWsRef.current?.close();
+      geminiWsRef.current = null;
+      setGeminiLiveConnected(false);
+      setServerPartial("");
+      addToast("Gemini Live Translation stopped", "info");
+      return;
+    }
+
+    // Stop normal turn-based listening if active, but reuse sessionId
+    if (listening) {
+      await toggleListen();
+    }
+
+    // Initialize AudioContext under direct user interaction gesture to satisfy browser autoplay policies
+    geminiPlayerRef.current?.init();
+
+    // Start capturing microphone immediately under the direct click gesture to avoid browser suspension!
+    const mic = new LiveMicCapture((b64) => {
+        if (geminiWsRef.current?.readyState === WebSocket.OPEN) {
+            geminiWsRef.current.send(JSON.stringify({
+                type: "audio_chunk",
+                data: b64
+            }));
+        }
+    });
+    geminiMicRef.current = mic;
+    try {
+      await mic.start();
+    } catch (err) {
+      addToast("Could not start microphone: " + String(err), "error");
+      geminiMicRef.current = null;
+      return;
+    }
+
+    addToast("Connecting to Gemini Live API...", "info");
+    
+    // Connect to WebSocket proxy
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const sessionParam = sessionId ? `&session_id=${sessionId}` : "";
+    const ws = new WebSocket(`${protocol}//${window.location.host.replace(":5173", ":8000")}/ws/live-translate?source_lang=${customerLang}&target_lang=${staffLang}${sessionParam}`);
+    geminiWsRef.current = ws;
+
+    ws.onopen = () => {
+      setGeminiLiveConnected(true);
+    };
+
+    ws.onmessage = async (ev) => {
+      const msg = JSON.parse(ev.data as string);
+      if (msg.type === "ready") {
+        addToast("Connected! Start speaking.", "ok");
+      } else if (msg.type === "audio_response") {
+        // Play audio from Gemini
+        geminiPlayerRef.current?.playChunk(msg.data);
+      } else if (msg.type === "interrupted") {
+        // Don't stop the player — let current translation finish playing.
+        // New translated audio will queue after it naturally via the player's scheduling.
+        // Just clear the text preview for the next turn.
+        setServerPartial("");
+      } else if (msg.type === "live_transcript") {
+        // Update live text transcription preview
+        setServerPartial(msg.input_text || "");
+      } else if (msg.type === "error") {
+        addToast(`Gemini Error: ${msg.message}`, "error");
+        toggleGeminiLive(); // auto disconnect
+      }
+    };
+
+    ws.onclose = () => {
+      setGeminiLiveConnected(false);
+      setListening(false);
+      setStaffListening(false);
+      geminiMicRef.current?.stop();
+      setServerPartial("");
+    };
   };
 
   const staffSpeak = () => {
@@ -795,6 +1000,56 @@ export default function App() {
     addToast(`Customer ID set: ${formatted}`, "ok");
   };
 
+  const getSpeakingState = () => {
+    if (geminiLiveConnected) {
+      if (geminiLivePlaying) {
+        return {
+          role: "ai",
+          label: `Gemini Translating & Speaking (${customerLangLabel} ⇄ ${staffLangLabel})`,
+          className: "speaking-ai",
+        };
+      } else if (serverPartial) {
+        return {
+          role: "user",
+          label: "Active Translation Mode (Listening…)",
+          className: "speaking-user",
+        };
+      }
+      return {
+        role: "idle",
+        label: "Gemini Live Translator Active (Ready)",
+        className: "speaking-idle",
+      };
+    } else {
+      if (listening) {
+        return {
+          role: "customer",
+          label: `Customer Speaking (${customerLangLabel})…`,
+          className: "speaking-customer",
+        };
+      } else if (staffListening) {
+        return {
+          role: "staff",
+          label: `Staff Speaking (${staffLangLabel})…`,
+          className: "speaking-staff",
+        };
+      } else if (isSpeechPlaying) {
+        return {
+          role: "ai",
+          label: "Playing Voice Translation…",
+          className: "speaking-ai",
+        };
+      }
+      return {
+        role: "idle",
+        label: "System Idle (Ready)",
+        className: "speaking-idle",
+      };
+    }
+  };
+
+  const currentSpeakState = getSpeakingState();
+
   return (
     <div className="dash">
       {apiOffline && (
@@ -949,8 +1204,16 @@ export default function App() {
           </div>
 
           <div className="topbar-actions">
+            <button
+              type="button"
+              className={geminiLiveConnected ? "danger" : "secondary"}
+              onClick={() => void toggleGeminiLive()}
+              title="Real-time end-to-end speech translation via Gemini"
+            >
+              {geminiLiveConnected ? "⏹ Stop Gemini Live" : "⚡ Gemini Live Translator"}
+            </button>
             {!sessionId && (
-              <button type="button" onClick={() => void startSession()} disabled={sessionLoading}>
+              <button type="button" onClick={() => void startSession()} disabled={sessionLoading || geminiLiveConnected}>
                 {sessionLoading ? "Starting…" : "▶ Start session"}
               </button>
             )}
@@ -961,6 +1224,33 @@ export default function App() {
             )}
           </div>
         </header>
+
+        {/* Animated Speaking Indicator Bar */}
+        <div className={`speaking-indicator-bar ${currentSpeakState.className}`}>
+          <div className="speaking-indicator-left">
+            <span className="speaking-pulse-dot" />
+            <span className="speaking-label">{currentSpeakState.label}</span>
+          </div>
+          {currentSpeakState.role !== "idle" ? (
+            <div className="voice-wave-container">
+              <span className="voice-wave-bar" />
+              <span className="voice-wave-bar" />
+              <span className="voice-wave-bar" />
+              <span className="voice-wave-bar" />
+              <span className="voice-wave-bar" />
+              <span className="voice-wave-bar" />
+              <span className="voice-wave-bar" />
+            </div>
+          ) : (
+            <div className="voice-wave-container idle">
+              <span className="voice-wave-bar" />
+              <span className="voice-wave-bar" />
+              <span className="voice-wave-bar" />
+              <span className="voice-wave-bar" />
+              <span className="voice-wave-bar" />
+            </div>
+          )}
+        </div>
 
         {/* Two-pane conversation */}
         <div className="dash-convo">
@@ -998,7 +1288,7 @@ export default function App() {
                   </div>
                 </article>
               ))}
-              {(partialLine || serverPartial) && listening && (
+              {(partialLine || serverPartial) && (listening || geminiLiveConnected) && (
                 <article className="convo-turn convo-turn-customer convo-turn-partial">
                   <span className="dot-typing"><i /><i /><i /></span>
                   <span>{displayText(partialLine || serverPartial)}</span>
@@ -1019,7 +1309,7 @@ export default function App() {
                   <line x1="12" y1="18" x2="12" y2="22" />
                   <line x1="8" y1="22" x2="16" y2="22" />
                 </svg>
-                <span>{listening ? "Listening… tap to stop" : `Listen (${customerLangLabel})`}</span>
+                <span>{listening ? "Speaking… tap to stop" : `Speak (${customerLangLabel})`}</span>
               </button>
             </div>
           </section>
@@ -1114,6 +1404,20 @@ export default function App() {
                 />
                 <button
                   type="button"
+                  className={`staff-mic-fab ${staffListening ? "staff-mic-fab-on" : ""}`}
+                  onClick={() => void toggleStaffListen()}
+                  disabled={!connected}
+                  title={staffListening ? "Listening… tap to stop" : `Speak (${staffLangLabel})`}
+                >
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                    <path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
+                    <path d="M19 10v1a7 7 0 0 1-14 0v-1" />
+                    <line x1="12" y1="18" x2="12" y2="22" />
+                    <line x1="8" y1="22" x2="16" y2="22" />
+                  </svg>
+                </button>
+                <button
+                  type="button"
                   className="send-fab"
                   onClick={sendStaffReply}
                   disabled={!connected || !staffText.trim()}
@@ -1199,3 +1503,4 @@ export default function App() {
     </div>
   );
 }
+
