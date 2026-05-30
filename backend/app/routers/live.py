@@ -106,15 +106,20 @@ async def live_translate_ws(
             parts=[
                 types.Part(
                     text=(
-                        f"You are a stateless speech translator. Translate each utterance independently.\n\n"
+                        f"You are a real-time speech translator for a bank branch desk.\n\n"
+                        f"SETUP:\n"
+                        f"- The CUSTOMER speaks {source_name}.\n"
+                        f"- The STAFF speaks {target_name}.\n\n"
                         f"RULES:\n"
-                        f"1. {source_name} → translate to {target_name}. {target_name} → translate to {source_name}.\n"
-                        f"2. Output ONLY the translation audio. Nothing else.\n"
-                        f"3. Each utterance is independent. Forget everything from before.\n"
-                        f"4. NEVER greet, introduce yourself, comment, or add any words beyond the translation.\n"
-                        f"5. NEVER repeat the original. Only speak the translated version.\n"
-                        f"6. After translating, stop and wait silently for the next utterance.\n"
-                        f"7. Keep translations natural and concise."
+                        f"1. When you hear the customer ({source_name}), translate it into {target_name} for the staff.\n"
+                        f"2. When you hear the staff ({target_name}), translate it into the customer's language. "
+                        f"Detect and REMEMBER the exact language the customer last spoke, and always reply to "
+                        f"staff speech in THAT same language.\n"
+                        f"3. Output ONLY the translation. NEVER greet, introduce yourself, comment, explain, or "
+                        f"add any words beyond the translation. NEVER repeat the original.\n"
+                        f"4. Keep translations natural and concise, then stop and wait silently for the next utterance.\n"
+                        f"5. Do not carry conversation content between utterances. The ONLY thing you remember "
+                        f"between turns is which language the customer uses."
                     )
                 )
             ]
@@ -178,6 +183,9 @@ async def live_translate_ws(
                     self.output_text = ""
                     self.input_finished = False
                     self.output_finished = False
+                    # None = unknown yet, True = staff→customer (speak audio),
+                    # False = customer→staff (text only, suppress audio)
+                    self.is_staff = None
 
             turn_state = TurnState()
 
@@ -237,10 +245,18 @@ async def live_translate_ws(
                 except Exception as e:
                     logger.error(f"Error reading client audio stream: {e}")
 
+            async def _continuous_receive():
+                """session.receive() yields a single turn then stops (it breaks on
+                turn_complete). Re-enter it in a loop so every subsequent utterance
+                keeps getting transcribed/translated for the life of the connection."""
+                while True:
+                    async for r in session.receive():
+                        yield r
+
             async def receive_from_gemini():
                 nonlocal turn_state
                 try:
-                    async for response in session.receive():
+                    async for response in _continuous_receive():
                         server_content = response.server_content
                         if server_content is None:
                             continue
@@ -267,6 +283,10 @@ async def live_translate_ws(
                             if tx.text:
                                 turn_state.input_text = tx.text
                                 turn_state.input_finished = bool(tx.finished)
+                                # Classify who is speaking from the transcript's script.
+                                # Staff speak the target (English) → spoken audio reply.
+                                # Customer speak a regional language → text only for staff.
+                                turn_state.is_staff = is_staff_turn(tx.text, source_lang, target_lang)
                                 # Force-send when finished, throttle otherwise
                                 await _send_transcript_throttled(force=turn_state.input_finished)
                                 finalize_turn_if_complete()
@@ -281,8 +301,11 @@ async def live_translate_ws(
                                 finalize_turn_if_complete()
 
                         # 4. Handle Model Output Audio Data Chunks — HIGHEST PRIORITY
+                        # Only SPEAK staff→customer translations. Customer→staff stays
+                        # text-only (staff reads it on screen), so skip audio when the
+                        # current turn was classified as the customer speaking.
                         model_turn = server_content.model_turn
-                        if model_turn is not None:
+                        if model_turn is not None and turn_state.is_staff is not False:
                             for part in model_turn.parts:
                                 if part.inline_data:
                                     audio_data = part.inline_data.data

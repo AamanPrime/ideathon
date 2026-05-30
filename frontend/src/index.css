@@ -2597,6 +2597,13 @@ html.a11y-captions .feed {
   display: flex;
   align-items: center;
   gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.convo-translated {
+  font-style: normal;
+  font-weight: 600;
+  color: var(--text-primary, #1e293b);
 }
 
 .convo-input {

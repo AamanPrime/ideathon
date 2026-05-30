@@ -118,6 +118,7 @@ export default function App() {
   const [, setLiveMetrics] = useState<Record<string, unknown> | null>(null);
   const [partialLine, setPartialLine] = useState("");
   const [serverPartial, setServerPartial] = useState("");
+  const [serverPartialOut, setServerPartialOut] = useState("");
 
   const [staffText, setStaffText] = useState("");
   const [staffTranslationPreview, setStaffTranslationPreview] = useState("");
@@ -620,6 +621,7 @@ export default function App() {
       geminiWsRef.current = null;
       setGeminiLiveConnected(false);
       setServerPartial("");
+      setServerPartialOut("");
       addToast("Gemini Live Translation stopped", "info");
       return;
     }
@@ -674,9 +676,11 @@ export default function App() {
         // New translated audio will queue after it naturally via the player's scheduling.
         // Just clear the text preview for the next turn.
         setServerPartial("");
+        setServerPartialOut("");
       } else if (msg.type === "live_transcript") {
-        // Update live text transcription preview
+        // Update live text transcription preview (original + translation)
         setServerPartial(msg.input_text || "");
+        setServerPartialOut(msg.output_text || "");
       } else if (msg.type === "error") {
         addToast(`Gemini Error: ${msg.message}`, "error");
         toggleGeminiLive(); // auto disconnect
@@ -689,6 +693,7 @@ export default function App() {
       setStaffListening(false);
       geminiMicRef.current?.stop();
       setServerPartial("");
+      setServerPartialOut("");
     };
   };
 
@@ -1292,6 +1297,9 @@ export default function App() {
                 <article className="convo-turn convo-turn-customer convo-turn-partial">
                   <span className="dot-typing"><i /><i /><i /></span>
                   <span>{displayText(partialLine || serverPartial)}</span>
+                  {serverPartialOut && (
+                    <span className="convo-translated">→ {displayText(serverPartialOut)}</span>
+                  )}
                 </article>
               )}
             </div>
