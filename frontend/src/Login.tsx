@@ -30,7 +30,13 @@ export default function Login({ onSuccess }: Props) {
     <div className="gate-root">
       <ThemeToggle />
       <form className="gate-form glass-panel" onSubmit={submit}>
-        <h2>Frontline Desk</h2>
+        <div className="gate-brand">
+          <span className="gate-logo" aria-hidden>UB</span>
+          <div>
+            <h2>Union Bank</h2>
+            <p className="gate-sub">Branch Assistant</p>
+          </div>
+        </div>
         <p className="small">
           Staff sign-in — JWT authentication
         </p>

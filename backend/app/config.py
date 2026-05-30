@@ -38,8 +38,20 @@ class Settings(BaseSettings):
     llm_base_url: str = "https://api.openai.com/v1"
     llm_model: str = "gpt-4o-mini"
 
+    # --- Google Gemini (real-time native audio) ---
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-live-2.5-flash-native-audio"
+    # Path to the Google Cloud service-account JSON (gitignored). Used for
+    # Vertex/Speech fallbacks; the Live API uses GEMINI_API_KEY directly.
+    google_application_credentials: str = "gcp_service_account.json"
+    gemini_project_id: str = ""
+
     # Demo / resilience
     demo_mode: bool = False
+
+    @property
+    def gemini_enabled(self) -> bool:
+        return bool(self.gemini_api_key.strip())
 
     @property
     def cors_list(self) -> list[str]:

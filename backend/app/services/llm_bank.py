@@ -14,6 +14,7 @@ from app.services.demo_oracle import (
     demo_form_extract,
     demo_summary,
 )
+from app.services.gemini_client import gemini_json
 from app.services.safety import sanitize_for_llm
 
 logger = logging.getLogger(__name__)
@@ -76,7 +77,14 @@ async def banking_json_completion(
     s = get_settings()
     api_key, base_url, model = s.llm_effective
     if not api_key or not model:
-        # Mock / unconfigured — caller should still get a usable shape.
+        # No OpenAI/Groq LLM configured. Use Gemini for real banking JSON when
+        # available; otherwise the caller falls back to the offline oracle.
+        if s.gemini_enabled:
+            return await gemini_json(
+                system=BANKING_SYSTEM,
+                user_prompt=sanitize_for_llm(user_prompt),
+                schema_hint=schema_hint,
+            )
         return {}
 
     safe_prompt = sanitize_for_llm(user_prompt)

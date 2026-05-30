@@ -24,6 +24,7 @@ from openai import AsyncOpenAI
 from app.config import get_settings
 from app.services.bhashini_client import BhashiniError, bhashini
 from app.services.demo_oracle import demo_translate
+from app.services.gemini_client import gemini_translate
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +153,20 @@ async def fast_translate(text: str, source_lang: str, target_lang: str) -> tuple
     s = get_settings()
     has_bhashini = bool(s.bhashini_user_id and s.bhashini_ulca_api_key)
 
-    # 1. Bhashini first when configured (matches the production pipeline).
+    # 0. Gemini (primary real-time engine) — high-quality Indic NMT, ~1s.
+    if s.gemini_enabled:
+        try:
+            translated = await asyncio.wait_for(
+                gemini_translate(text, source_lang, target_lang),
+                timeout=6.0,
+            )
+            if translated and translated.strip() and translated.strip() != text:
+                _cache_put(key, translated)
+                return translated, "gemini"
+        except asyncio.TimeoutError:
+            logger.info("fast_translate: Gemini timed out, falling back")
+
+    # 1. Bhashini when configured (matches the production pipeline).
     if has_bhashini:
         try:
             translated = await asyncio.wait_for(

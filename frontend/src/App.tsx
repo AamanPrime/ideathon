@@ -804,10 +804,10 @@ export default function App() {
       {/* ----- SIDEBAR ----- */}
       <aside className="dash-sidebar">
         <div className="dash-sidebar-brand">
-          <div className="brand-logo" aria-hidden>FD</div>
+          <div className="brand-logo" aria-hidden>UB</div>
           <div>
-            <strong>Frontline Desk</strong>
-            <span>Branch voice assistant</span>
+            <strong>Union Bank</strong>
+            <span>Branch Assistant</span>
           </div>
         </div>
 
@@ -978,7 +978,7 @@ export default function App() {
               {customerTurns.length === 0 && (
                 <div className="convo-empty">
                   <div className="convo-empty-icon">🎙</div>
-                  <p>Press the mic below or pick a scenario. The customer's speech appears here in their language and is translated to your language for context.</p>
+                  <p>Press the mic below to start. The customer's speech appears here in their language and is translated to your language in real time.</p>
                 </div>
               )}
               {customerTurns.map((l, i) => (
