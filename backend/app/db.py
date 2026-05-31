@@ -17,8 +17,12 @@ class Base(DeclarativeBase):
 
 
 _settings = get_settings()
+db_url = _settings.database_url
+if db_url.startswith("postgresql://"):
+    db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+
 # echo=False to keep WS logs clean; switch to True when debugging SQL
-engine = create_async_engine(_settings.database_url, echo=False, future=True)
+engine = create_async_engine(db_url, echo=False, future=True)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 
