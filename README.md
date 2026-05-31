@@ -1,158 +1,215 @@
-# Frontline Desk — Multilingual Gen-AI Banking Voice Assistant
+# BharatVaani — Multilingual Gen-AI Banking Voice Assistant
 
-Real-time multilingual voice loop for branch staff:
+**Team AlphaForge · PSBs Hackathon Series 2026 (IDEA 2.0 · Union Bank of India)**
 
-1. **Real multilingual voice loop** — Indic customer in → ASR → MT → staff sees own language → staff replies → MT → TTS plays back in customer's language. Powered by **Bhashini** ULCA pipelines.
-2. **Banking-aware intelligence** — intent (loan / KYC / dispute / …), glossary, risk-phrase flags, SOP next-steps, regulatory disclaimers. Powered by **Groq** (or any OpenAI-compatible LLM).
-3. **Smart form auto-fill** — extracts name, DOB, address, PAN, masked Aadhaar, phone, email from the live conversation as a CBS/CRM-style pre-fill.
-4. **Trust & governance** — real JWT auth with roles, PII redacted before persistence, audit log table, optional redacted export.
-5. **Bilingual interaction record** — every session generates a structured bilingual summary (purpose, points, products, follow-ups) stored in the DB for the audit file.
+A real-time, two-way voice assistant for bank frontline desks. The customer speaks
+in **any of 11+ Indian languages**; the officer hears and reads it in English and
+replies normally; the customer **hears the reply back in their own language** — all
+in **under a second per turn**. Alongside translation, the system understands banking
+intent, auto-fills KYC fields, masks PII, and writes a **bilingual, auditable record**
+of every conversation.
 
-> **Stack:** FastAPI + Postgres/SQLite + React (Vite) + Bhashini + Groq.
+> **Verified working** end-to-end on **Hindi** and **Gujarati** using
+> **Google Gemini Live (native audio)** on **Vertex AI**.
 
 ---
 
-## Quick start (zero-setup demo)
+## 1. The problem
 
-The default DB is a local **SQLite** file, the LLM provider can run in **mock** mode if you have no Groq key, and Bhashini falls back to `DEMO_MODE` demo strings if no keys.
+India has 22 official languages and 120+ widely spoken ones, yet only ~10% of Indians
+are comfortable in English. A bank officer at a branch frequently shares **no common
+language** with the customer in front of them. With no interpreters available, this gap
+causes:
 
-### 1. Backend
+- Slow service, KYC / data-entry errors, and mis-selling
+- Exclusion of low-literacy, migrant, senior and regional-language customers
+- Compliance risk against RBI's regional-language service expectations
+- Staff having to be hired and posted **by language**
 
+This affects **~200,000 bank branches** and **1.35 million+ banking correspondents**
+across India.
+
+---
+
+## 2. What it does
+
+1. **Real-time speech-to-speech translation** — Indic customer voice ⇄ English staff
+   voice, bidirectional, turn-by-turn, < 1 s latency. Powered by **Gemini Live
+   native-audio** (no brittle ASR→MT→TTS chain).
+2. **Automatic language detection + memory** — no dropdowns; the customer just talks
+   and is always answered in the same language they used.
+3. **Banking-aware intelligence** — intent (account opening / loan / card dispute /
+   remittance / locker), KYC form auto-fill, risk-phrase flags, SOP talking points.
+   Powered by **Gemini 2.5 Flash**.
+4. **Trust & governance** — JWT auth with roles, PII redaction (PAN / Aadhaar / phone /
+   email) before persistence, audit-log table, redacted export.
+5. **Bilingual interaction record** — every session generates a structured bilingual
+   summary (purpose, key points, products, follow-ups, compliance notes) for the audit file.
+
+> **Stack:** React + Vite + TypeScript · FastAPI (async) · SQLAlchemy 2 · SQLite/Postgres ·
+> WebSockets · Google Gemini Live + Gemini 2.5 Flash on **Vertex AI** · JWT.
+
+---
+
+## 3. Architecture (overview)
+
+```
+Customer voice ─► Branch Desk (React + AudioWorklet, PCM16 @16kHz)
+              ─► Real-Time Gateway (FastAPI · WebSocket · JWT · session store)
+              ─► Gemini Live · Vertex AI (auto-detect · VAD · speech ⇄ speech)
+   ◄── translated audio + live transcript stream back in < 1s (bidirectional) ──
+
+   Each finished turn ─► Gemini 2.5 Flash (intent · KYC autofill · PII masking · summary)
+                      ─► Secure datastore (bilingual records · audit log · RBAC)
+```
+
+The live audio loop lives in `backend/app/routers/live.py` (`/ws/live-translate`).
+Live session state stays in RAM for hot-path latency; the DB is the audit-grade mirror,
+and only **redacted** turns are persisted. See the Technical Architecture document for the
+full labelled diagram and component breakdown.
+
+---
+
+## 4. How to run
+
+### Prerequisites
+- **Python 3.11+** (developed on 3.13) and **Node 18+**
+- A **Google Cloud service-account JSON** with Vertex AI access (for the live audio
+  path), or a `GEMINI_API_KEY` for the text-only fallback.
+
+### 4.1 Backend
 ```bash
 cd backend
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env       # fill in keys (or leave defaults for the demo)
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+pip install -r requirements.txt          # FastAPI, SQLAlchemy, google-genai, etc.
+
+# Credentials (NEVER commit these — both are gitignored):
+#   place the GCP service-account JSON at backend/gcp_service_account.json
+cp .env.example .env                      # then edit values (see table below)
+
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
+On first launch the backend creates `frontline_desk.db` (SQLite), seeds an **admin user**
+(`SEED_ADMIN_EMAIL` / `SEED_ADMIN_PASSWORD`, defaults `admin@bank.local` / `ChangeMe!123`),
+and prints the active AI provider.
 
-On first launch, the backend:
-
-- Creates the SQLite DB (`frontline_desk.db`)
-- Seeds an **admin user** from `SEED_ADMIN_EMAIL` / `SEED_ADMIN_PASSWORD` (defaults: `admin@example.com` / `ChangeMe!123`)
-- Prints the active LLM provider
-
-### 2. Frontend
-
+### 4.2 Frontend
 ```bash
 cd frontend
 npm install
-npm run dev
+npm run dev        # serves on http://localhost:5173  (use localhost, not 127.0.0.1)
 ```
-
-Open <http://localhost:5173> and sign in with the seed admin. The form is pre-filled with the demo credentials.
-
----
-
-## Environment variables (`backend/.env`)
-
-| Variable                                                       | What it does                                                                                         |
-| -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `DATABASE_URL`                                                 | `sqlite+aiosqlite:///./frontline_desk.db` (default) or `postgresql+asyncpg://user:pass@host:5432/db` |
-| `JWT_SECRET`                                                   | HMAC secret for signing JWTs (rotate in prod)                                                        |
-| `JWT_ACCESS_TTL_MIN`                                           | Access-token lifetime (default 720 min)                                                              |
-| `SEED_ADMIN_EMAIL` / `SEED_ADMIN_PASSWORD` / `SEED_ADMIN_NAME` | First admin created on empty DB                                                                      |
-| `BHASHINI_USER_ID` / `BHASHINI_ULCA_API_KEY`                   | Bhashini ULCA credentials (ASR + MT + TTS). Without these, `DEMO_MODE` strings are used              |
-| `LLM_PROVIDER`                                                 | `groq` (default), `openai`, or `mock`                                                                |
-| `GROQ_API_KEY` / `GROQ_MODEL`                                  | Groq creds — model defaults to `llama-3.3-70b-versatile`                                             |
-| `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL`                   | OpenAI-compatible alternative                                                                        |
-| `DEMO_MODE`                                                    | Force demo transcripts even with Bhashini configured                                                 |
-| `CORS_ORIGINS`                                                 | Comma-separated origins (Vite dev defaults work out of the box)                                      |
+Open **http://localhost:5173**, sign in with the seed admin, choose languages, start the
+live session, allow the microphone, and speak.
 
 ---
 
-## Switching to Postgres
+## 5. Dependencies
 
-```bash
-docker run --rm -d --name frontline-pg -p 5432:5432 \
-  -e POSTGRES_PASSWORD=devpass -e POSTGRES_DB=frontline_desk postgres:16
+**Backend (Python):** `fastapi`, `uvicorn`, `sqlalchemy[asyncio]`, `aiosqlite`,
+`pydantic-settings`, `pyjwt` / `python-jose`, `passlib[bcrypt]`, **`google-genai`**
+(Vertex AI + Gemini Live), `python-multipart`, `websockets`. Full list in
+`backend/requirements.txt`.
 
-# in .env
-DATABASE_URL=postgresql+asyncpg://postgres:devpass@localhost:5432/frontline_desk
-```
+**Frontend (Node):** `react`, `react-dom`, `vite`, `typescript`. Uses the browser
+**Web Audio / AudioWorklet** and **WebSocket** APIs (no extra audio libs). Full list in
+`frontend/package.json`.
 
-Restart the backend — tables auto-create on startup. For schema migrations across releases use `alembic` (the `alembic` package is pre-installed; `alembic init` to scaffold).
+**Cloud:** Google **Vertex AI** with the Gemini Live API enabled on the project.
 
----
-
-## API surface
-
-All endpoints below (except `/health`, `/auth/login`) require `Authorization: Bearer <jwt>`.
-
-| Method   | Path                                      | Purpose                                             |
-| -------- | ----------------------------------------- | --------------------------------------------------- |
-| `GET`    | `/health`                                 | Provider/DB status                                  |
-| `POST`   | `/auth/login`                             | Email + password → JWT + user object                |
-| `GET`    | `/auth/me`                                | Current user                                        |
-| `POST`   | `/auth/register` (admin)                  | Create staff users                                  |
-| `POST`   | `/session`                                | Open a desk session (DB row + in-memory live state) |
-| `GET`    | `/sessions`                               | List your sessions (admins see all)                 |
-| `GET`    | `/sessions/{id}`                          | Full bilingual record + redacted turns              |
-| `POST`   | `/summary`                                | Generate + persist bilingual summary                |
-| `GET`    | `/session/{id}/metrics`                   | Live KPIs for the in-memory session                 |
-| `GET`    | `/session/{id}/export?redact=true\|false` | JSON export packet                                  |
-| `DELETE` | `/session/{id}`                           | Close session, mirror to DB                         |
-| `WS`     | `/ws/desk/{session_id}?token=<jwt>`       | Realtime: audio chunks, partials, copilot, TTS      |
+### Environment variables (`backend/.env`)
+| Variable | What it does |
+| --- | --- |
+| `DATABASE_URL` | `sqlite+aiosqlite:///./frontline_desk.db` (default) or a Postgres async URL |
+| `JWT_SECRET` | HMAC secret for signing JWTs (rotate in prod) |
+| `SEED_ADMIN_EMAIL` / `SEED_ADMIN_PASSWORD` / `SEED_ADMIN_NAME` | First admin created on empty DB |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Path to the GCP service-account JSON (default `gcp_service_account.json`) |
+| `GEMINI_PROJECT_ID` | GCP project ID for Vertex AI |
+| `VERTEX_LOCATION` | Vertex region (default `us-central1`) |
+| `GEMINI_MODEL` | Live model (default `gemini-live-2.5-flash-native-audio`) |
+| `GEMINI_API_KEY` | Optional key for the OpenAI-compatible text fallback |
+| `CORS_ORIGINS` | Comma-separated origins (Vite dev defaults work out of the box) |
 
 ---
 
-## Data model
+## 6. Sample data
 
-- **`users`** — `id`, `email`, `password_hash` (bcrypt), `role` (`admin`/`staff`), `branch_code`, `preferred_lang`
-- **`desk_sessions`** — owner, langs, customer_ref, JSON `metrics`, JSON `form_snapshot`, JSON `turns` (redacted), `status`
-- **`interaction_records`** — bilingual summary (staff + customer language), full payload JSON, per session
-- **`audit_events`** — every login, register, session open/close/export
-
-PII redaction (`app.services.safety.redact_mapping`) runs **before** anything is written to `desk_sessions.turns`, so the database never stores a raw Aadhaar / PAN / phone / email.
-
----
-
-## Architecture notes
-
-- **Live state stays in RAM**, the DB is the audit-grade mirror. The WebSocket handler reads/writes the in-memory `DeskSession` for hot-path latency, and a `_persist_turn` helper appends a _redacted_ copy to the DB row asynchronously.
-- **Bhashini ULCA**: `services/bhashini_client.py` resolves pipeline config + compute URLs per call. WAV 16 kHz is the default ASR format the React mic capture sends.
-- **LLM is swappable** via `LLM_PROVIDER`. Both Groq and OpenAI expose an OpenAI-compatible chat completions endpoint, so one `AsyncOpenAI` client + a different `base_url` is all that's needed (`config.Settings.llm_effective`).
-- **WebSocket auth**: token is sent as a `?token=` query param because browsers don't allow custom headers on WS handshakes.
-
----
-
-## What changed from v0.2
-
-- `+ /backend/app/db.py`, `+ /backend/app/models.py` — SQLAlchemy 2 async engine + ORM models
-- `+ /backend/app/auth.py`, `+ /backend/app/routers/auth.py` — bcrypt + JWT + role guards + WS auth
-- `~ /backend/app/main.py` — auth-guarded routes, DB-persistent sessions, redacted turn mirroring, `lifespan` seed-admin bootstrap
-- `~ /backend/app/services/llm_bank.py` — provider-aware (`groq` / `openai` / `mock`)
-- `+ /frontend/src/auth.ts`, `+ /frontend/src/Login.tsx`, `+ /frontend/src/History.tsx`
-- `~ /frontend/src/App.tsx` — real login screen, JWT on all fetches + WS, history portal, sign-out wipes auth
+- **Seed admin user** is created automatically on first run — `admin@bank.local` /
+  `ChangeMe!123`. Use it to sign in immediately; no data import needed.
+- **Synthetic audio for testing the live loop** — generate sample utterances and stream
+  them through the WebSocket (no microphone needed):
+  ```bash
+  # Hindi (macOS voice) and Gujarati (gTTS), converted to 16 kHz PCM
+  say -v Lekha -o /tmp/hindi.aiff "मुझे एक बचत खाता खोलना है"
+  ffmpeg -y -i /tmp/hindi.aiff -ar 16000 -ac 1 -f s16le /tmp/hindi.pcm
+  python -c "from gtts import gTTS; gTTS('મારે બચત ખાતું ખોલવું છે', lang='gu').save('/tmp/guj.mp3')"
+  ffmpeg -y -i /tmp/guj.mp3 -ar 16000 -ac 1 -f s16le /tmp/guj.pcm
+  ```
+- **Integration test scripts** (in `backend/`) stream that audio at the live endpoint and
+  print the transcript + translation + whether translated audio came back:
+  - `test_live_ws.py` — single Hindi → English turn
+  - `test_live_twoturn.py` — Hindi → English **then** English → Hindi (multi-turn, bidirectional)
+  - `test_live_gujarati.py` — Gujarati ⇄ English
+  ```bash
+  python test_live_twoturn.py     # backend must be running on :8000
+  ```
 
 ---
 
-## License
+## 7. Known limitations
 
-Released under the **MIT License**.
+- **Languages verified end-to-end:** Hindi and Gujarati. The model supports many more
+  (target 22+), but only these two are fully validated in our tests.
+- **Cloud dependency:** the live audio path requires **Vertex AI Gemini Live to be
+  enabled** on the GCP project and network access to Google. There is no offline mode yet.
+- **On-prem / local LLM (Ollama) deployment** for strict data residency is **designed but
+  not yet implemented** — current builds run on Vertex AI (India-region capable).
+- **Speaker attribution is heuristic:** the customer-vs-staff direction is inferred from
+  the transcript's script (Indic vs Latin). This is clean for a regional-language customer
+  + English-speaking officer, but ambiguous if both speak the same script.
+- **Microphone + modern browser required;** the frontend serves on `localhost` (use
+  `localhost:5173`, not `127.0.0.1`). Audio autoplay needs a user gesture.
+- **Latency / reliability** depend on the branch's internet link; a text fallback exists
+  but is less seamless than the native-audio loop.
+- **Cost at national scale** is non-trivial; production would use language-pack tiers and
+  autoscaling to control unit cost.
+- **Not yet integrated** with a real Core Banking System / CRM — KYC autofill is a
+  pre-fill surface, not a write-back to CBS.
 
-```
-MIT License
+---
 
-Copyright (c) 2026 Frontline Desk contributors
+## 8. API surface
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+All endpoints (except `/health`, `/auth/login`) require `Authorization: Bearer <jwt>`.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/health` | Provider / DB status |
+| `POST` | `/auth/login` | Email + password → JWT + user |
+| `GET` | `/auth/me` | Current user |
+| `POST` | `/auth/register` (admin) | Create staff users |
+| `POST` | `/session` | Open a desk session |
+| `GET` | `/sessions` · `/sessions/{id}` | List / fetch sessions (bilingual record) |
+| `POST` | `/summary` | Generate + persist bilingual summary |
+| `GET` | `/session/{id}/metrics` · `/export` | KPIs / JSON export |
+| `WS` | `/ws/live-translate?source_lang=&target_lang=&session_id=` | **Live Gemini speech-to-speech translation** |
+| `WS` | `/ws/desk/{session_id}?token=<jwt>` | Turn-based desk channel (copilot, summaries) |
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
+---
 
-Third-party services (Bhashini, Groq, OpenAI) retain their own terms of use; this license covers only the code in this repository.
+## 9. Data model
+
+- **`users`** — `email`, bcrypt `password_hash`, `role` (admin/staff), `branch_code`, `preferred_lang`
+- **`desk_sessions`** — owner, langs, customer_ref, JSON `metrics` / `form_snapshot` / `turns` (redacted), `status`
+- **`interaction_records`** — bilingual summary + full payload JSON, per session
+- **`audit_events`** — login, register, session open/close/export
+
+PII redaction runs **before** anything is written to `desk_sessions.turns`, so the DB
+never stores a raw Aadhaar / PAN / phone / email.
+
+---
+
+## 10. License
+
+Released under the **MIT License**. Third-party services (Google Gemini / Vertex AI)
+retain their own terms; this license covers only the code in this repository.
