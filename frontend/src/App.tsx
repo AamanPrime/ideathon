@@ -150,6 +150,8 @@ export default function App() {
   const [isSpeechPlaying, setIsSpeechPlaying] = useState(false);
   const staffSpeechRef = useRef<SpeechRecognition | null>(null);
   const [geminiLivePlaying, setGeminiLivePlaying] = useState(false);
+  const lastSentFinalRef = useRef<string>("");
+  const isSpeechPlayingRef = useRef(false);
 
   const addToast = useCallback((msg: string, type: "info" | "error" | "ok" = "info") => {
     const id = ++toastIdRef.current;
@@ -233,27 +235,43 @@ export default function App() {
     rec.interimResults = true;
     const effectiveCustomerLang = customerLang === "none" ? "hi" : customerLang;
     rec.lang = BCP47[effectiveCustomerLang] || `${effectiveCustomerLang}-IN`;
+
+    // Track which result indices have already been finalized to prevent
+    // Chrome's continuous mode from re-sending old finals when resultIndex
+    // glitches back to 0.
+    const finalizedIndices = new Set<number>();
+
     rec.onresult = (ev: SpeechRecognitionEvent) => {
+      // Skip recognition results while TTS is playing to prevent feedback loop
+      if (isSpeechPlayingRef.current) return;
+
       let interim = "";
       let final = "";
       for (let i = ev.resultIndex; i < ev.results.length; i++) {
         const r = ev.results[i];
         const t = r[0]?.transcript || "";
-        if (r.isFinal) final += t;
-        else interim += t;
+        if (r.isFinal) {
+          // Skip already-processed finals
+          if (finalizedIndices.has(i)) continue;
+          finalizedIndices.add(i);
+          final += t;
+        } else {
+          interim += t;
+        }
       }
       const show = final || interim;
       setPartialLine(show);
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      if (show) {
-        ws.send(JSON.stringify({ type: "customer_interim", text: show, is_final: Boolean(final) }));
+      if (show && !final) {
+        ws.send(JSON.stringify({ type: "customer_interim", text: show, is_final: false }));
       }
-      // When ASR finalises a phrase, commit it as a real customer turn so the
-      // backend runs translation + intent + form-prefill + copilot enrichment.
       if (final.trim()) {
+        if (final.trim() === lastSentFinalRef.current) return;
+        lastSentFinalRef.current = final.trim();
         ws.send(JSON.stringify({ type: "customer_text", text: final.trim(), lang: customerLang }));
         setPartialLine("");
+        setTimeout(() => { lastSentFinalRef.current = ""; }, 3000);
       }
     };
     rec.onerror = () => undefined;
@@ -330,9 +348,9 @@ export default function App() {
         u.rate = 0.92;
         u.pitch = 1.0;
         if (voice) u.voice = voice;
-        u.onstart = () => setIsSpeechPlaying(true);
-        u.onend = () => setIsSpeechPlaying(false);
-        u.onerror = () => setIsSpeechPlaying(false);
+        u.onstart = () => { setIsSpeechPlaying(true); isSpeechPlayingRef.current = true; };
+        u.onend = () => { setIsSpeechPlaying(false); isSpeechPlayingRef.current = false; };
+        u.onerror = () => { setIsSpeechPlaying(false); isSpeechPlayingRef.current = false; };
         synth.speak(u);
       } catch {
         setIsSpeechPlaying(false);
@@ -501,51 +519,27 @@ export default function App() {
   }, [authUser]);
 
   const toggleListen = async () => {
-    // Always route through the Gemini Live Translator for real-time translation
-    if (geminiLiveConnected || listening) {
-      // Stop: turn off Gemini Live if active, or old listen if somehow active
-      if (geminiLiveConnected) {
-        await geminiMicRef.current?.stop();
-        geminiMicRef.current = null;
-        geminiPlayerRef.current?.stop();
-        geminiWsRef.current?.close();
-        geminiWsRef.current = null;
-        setGeminiLiveConnected(false);
-        setServerPartial("");
-      }
-      if (listening) {
-        stopPlayback();
-        await micRef.current?.stop();
-        micRef.current = null;
-        setPartialLine("");
-      }
+    if (listening) {
+      stopPlayback();
+      speechRef.current?.stop();
+      speechRef.current = null;
+      setPartialLine("");
       setListening(false);
-      return;
+    } else {
+      stopPlayback();
+      setListening(true);
     }
-    // Start Gemini Live Translator automatically
-    stopPlayback();
-    setListening(true);
-    await toggleGeminiLive();
   };
 
   const toggleStaffListen = async () => {
-    // Route staff speech through Gemini Live Translator too
-    if (geminiLiveConnected || staffListening) {
-      if (geminiLiveConnected) {
-        await geminiMicRef.current?.stop();
-        geminiMicRef.current = null;
-        geminiPlayerRef.current?.stop();
-        geminiWsRef.current?.close();
-        geminiWsRef.current = null;
-        setGeminiLiveConnected(false);
-        setServerPartial("");
-      }
+    if (staffListening) {
+      staffSpeechRef.current?.stop();
+      staffSpeechRef.current = null;
       setStaffListening(false);
-      return;
+    } else {
+      stopPlayback();
+      setStaffListening(true);
     }
-    stopPlayback();
-    setStaffListening(true);
-    await toggleGeminiLive();
   };
 
   useEffect(() => {
@@ -1209,16 +1203,8 @@ export default function App() {
           </div>
 
           <div className="topbar-actions">
-            <button
-              type="button"
-              className={geminiLiveConnected ? "danger" : "secondary"}
-              onClick={() => void toggleGeminiLive()}
-              title="Real-time end-to-end speech translation via Gemini"
-            >
-              {geminiLiveConnected ? "⏹ Stop Gemini Live" : "⚡ Gemini Live Translator"}
-            </button>
             {!sessionId && (
-              <button type="button" onClick={() => void startSession()} disabled={sessionLoading || geminiLiveConnected}>
+              <button type="button" onClick={() => void startSession()} disabled={sessionLoading}>
                 {sessionLoading ? "Starting…" : "▶ Start session"}
               </button>
             )}

@@ -445,16 +445,19 @@ async def _finalize_staff_turn(
     sess.metrics.staff_turns += 1
     sess.log_audit("staff_turn", {"chars": len(text_original)})
 
-    await _persist_turn(
-        sess.session_id,
-        {
-            "role": "staff",
-            "source_lang": sess.staff_lang,
-            "text_original": text_original,
-            "text_translated": text_translated,
-            "confidence": 1.0,
-            "ts": turn.ts,
-        },
+    # Fire-and-forget DB persistence
+    asyncio.create_task(
+        _persist_turn(
+            sess.session_id,
+            {
+                "role": "staff",
+                "source_lang": sess.staff_lang,
+                "text_original": text_original,
+                "text_translated": text_translated,
+                "confidence": 1.0,
+                "ts": turn.ts,
+            },
+        )
     )
 
     ws = sess.ws
@@ -479,6 +482,13 @@ async def _finalize_customer_turn(
     text_translated: str,
     api_confidence: float | None,
 ) -> None:
+    """Process a finalized customer turn with non-blocking enrichment.
+
+    The transcript is sent to the frontend immediately. Heavy Gemini calls
+    (enrich_turn, extract_form_and_signals) and DB persistence run as
+    concurrent background tasks so the WebSocket loop stays responsive for
+    the next speech segment.
+    """
     conf = merge_asr_confidence(api_confidence, text_original)
     if conf < 0.5:
         sess.metrics.low_confidence_segments += 1
@@ -494,16 +504,19 @@ async def _finalize_customer_turn(
     sess.turns.append(turn)
     sess.log_audit("customer_turn", {"confidence": conf, "chars": len(text_original)})
 
-    await _persist_turn(
-        sess.session_id,
-        {
-            "role": "customer",
-            "source_lang": sess.customer_lang,
-            "text_original": text_original,
-            "text_translated": text_translated,
-            "confidence": conf,
-            "ts": turn.ts,
-        },
+    # --- Fire-and-forget: DB persistence ---
+    asyncio.create_task(
+        _persist_turn(
+            sess.session_id,
+            {
+                "role": "customer",
+                "source_lang": sess.customer_lang,
+                "text_original": text_original,
+                "text_translated": text_translated,
+                "confidence": conf,
+                "ts": turn.ts,
+            },
+        )
     )
 
     ws = sess.ws
@@ -530,51 +543,62 @@ async def _finalize_customer_turn(
     except Exception:  # noqa: BLE001
         return
 
-    recent = "\n".join(f"{t.role}: {t.text_original}" for t in sess.turns[-8:])
-    enrich = await enrich_turn(
-        transcript_customer_lang=text_original,
-        translation_staff_lang=text_translated,
-        recent_context=recent,
-        asr_confidence=conf,
-    )
-    if enrich.get("intent"):
-        sess.last_intent = str(enrich["intent"])
-    discs = disclaimers_for_intent(sess.last_intent, sess.staff_lang, sess.customer_lang)
-    agent_g = guidelines_for_intent(sess.last_intent)
-    try:
-        await ws.send_json(
-            {
-                "type": "copilot",
-                "intent": enrich.get("intent"),
-                "intent_confidence": enrich.get("intent_confidence"),
-                "risk_flags": enrich.get("risk_flags") or [],
-                "talking_points": enrich.get("talking_points_staff_lang") or [],
-                "disambiguation_options": enrich.get("disambiguation_options") or [],
-                "low_confidence_fallback": enrich.get("low_confidence_fallback"),
-                "code_mixing_note": enrich.get("code_mixing_note"),
-                "process_guide": guide_for_intent(sess.last_intent, sess.staff_lang),
-                "process_guide_customer": guide_for_intent(sess.last_intent, sess.customer_lang),
-                "disclaimers_staff": discs["staff_lang"],
-                "disclaimers_customer": discs["customer_lang"],
-                "agent_guidelines": agent_g,
-            }
-        )
-    except Exception:  # noqa: BLE001
-        return
+    # --- Background enrichment: copilot + form extraction run concurrently ---
+    async def _bg_enrich_and_form():
+        """Run copilot enrichment and form extraction in parallel, streaming
+        each result to the frontend as soon as it completes."""
+        recent = "\n".join(f"{t.role}: {t.text_original}" for t in sess.turns[-8:])
 
-    snippet = recent[-4000:]
-    form_partial = await extract_form_and_signals(conversation_snippet=snippet, staff_lang=sess.staff_lang)
-    sess.form.merge(form_partial)
-    try:
-        await ws.send_json(
-            {
-                "type": "form_prefill",
-                "fields": sess.form.__dict__.copy(),
-                "raw_extraction": {k: v for k, v in form_partial.items() if k not in ("risk_flags",)},
-            }
-        )
-    except Exception:  # noqa: BLE001
-        pass
+        async def _do_enrich():
+            try:
+                enrich = await enrich_turn(
+                    transcript_customer_lang=text_original,
+                    translation_staff_lang=text_translated,
+                    recent_context=recent,
+                    asr_confidence=conf,
+                )
+                if enrich.get("intent"):
+                    sess.last_intent = str(enrich["intent"])
+                discs = disclaimers_for_intent(sess.last_intent, sess.staff_lang, sess.customer_lang)
+                agent_g = guidelines_for_intent(sess.last_intent)
+                await ws.send_json(
+                    {
+                        "type": "copilot",
+                        "intent": enrich.get("intent"),
+                        "intent_confidence": enrich.get("intent_confidence"),
+                        "risk_flags": enrich.get("risk_flags") or [],
+                        "talking_points": enrich.get("talking_points_staff_lang") or [],
+                        "disambiguation_options": enrich.get("disambiguation_options") or [],
+                        "low_confidence_fallback": enrich.get("low_confidence_fallback"),
+                        "code_mixing_note": enrich.get("code_mixing_note"),
+                        "process_guide": guide_for_intent(sess.last_intent, sess.staff_lang),
+                        "process_guide_customer": guide_for_intent(sess.last_intent, sess.customer_lang),
+                        "disclaimers_staff": discs["staff_lang"],
+                        "disclaimers_customer": discs["customer_lang"],
+                        "agent_guidelines": agent_g,
+                    }
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("bg enrich failed: %s", e)
+
+        async def _do_form():
+            try:
+                snippet = recent[-4000:]
+                form_partial = await extract_form_and_signals(conversation_snippet=snippet, staff_lang=sess.staff_lang)
+                sess.form.merge(form_partial)
+                await ws.send_json(
+                    {
+                        "type": "form_prefill",
+                        "fields": sess.form.__dict__.copy(),
+                        "raw_extraction": {k: v for k, v in form_partial.items() if k not in ("risk_flags",)},
+                    }
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("bg form extract failed: %s", e)
+
+        await asyncio.gather(_do_enrich(), _do_form())
+
+    asyncio.create_task(_bg_enrich_and_form())
 
 
 async def _process_customer_audio(
@@ -792,101 +816,113 @@ async def desk_ws(
                 raw = (msg.get("text") or "").strip()
                 if not raw:
                     continue
-                lang = msg.get("lang") or sess.customer_lang
-                
-                # Auto-detect language if none is selected
-                if lang == "none" or sess.customer_lang == "none":
-                    detected = await detect_language(raw)
-                    sess.customer_lang = detected
-                    lang = detected
-                    # Save detected language to DB
-                    async with SessionLocal() as db:
-                        from sqlalchemy import update
-                        await db.execute(
-                            update(DeskSessionRow)
-                            .where(DeskSessionRow.id == sess.session_id)
-                            .values(customer_lang=detected)
-                        )
-                        await db.commit()
-                    # Broadcast update to frontend
-                    await websocket.send_json({
-                        "type": "language_detected",
-                        "customer_lang": detected
-                    })
+                _ct_lang = msg.get("lang") or sess.customer_lang
 
-                if lang == sess.staff_lang:
-                    translated = raw
-                else:
-                    translated, _engine = await fast_translate(raw, lang, sess.staff_lang)
-                await _finalize_customer_turn(sess, raw, translated, 0.99)
-                
-                # Generate voice output (TTS fallback) for the staff in their desired language
-                sess.metrics.tts_playouts += 1
-                await websocket.send_json(
-                    {
-                        "type": "tts_fallback",
-                        "lang": sess.staff_lang,
-                        "text": translated,
-                        "reason": "browser_native_tts",
-                    }
-                )
+                async def _handle_customer_text(text: str, lang: str):
+                    try:
+                        # Auto-detect language if none is selected
+                        if lang == "none" or sess.customer_lang == "none":
+                            detected = await detect_language(text)
+                            sess.customer_lang = detected
+                            lang = detected
+                            # Save detected language to DB
+                            async with SessionLocal() as db:
+                                from sqlalchemy import update
+                                await db.execute(
+                                    update(DeskSessionRow)
+                                    .where(DeskSessionRow.id == sess.session_id)
+                                    .values(customer_lang=detected)
+                                )
+                                await db.commit()
+                            # Broadcast update to frontend
+                            await websocket.send_json({
+                                "type": "language_detected",
+                                "customer_lang": detected
+                            })
+
+                        if lang == sess.staff_lang:
+                            translated = text
+                        else:
+                            translated, _engine = await fast_translate(text, lang, sess.staff_lang)
+                        await _finalize_customer_turn(sess, text, translated, 0.99)
+
+                        # Generate voice output (TTS fallback) for staff
+                        sess.metrics.tts_playouts += 1
+                        await websocket.send_json(
+                            {
+                                "type": "tts_fallback",
+                                "lang": sess.staff_lang,
+                                "text": translated,
+                                "reason": "browser_native_tts",
+                            }
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("customer_text bg failed: %s", e)
+
+                asyncio.create_task(_handle_customer_text(raw, _ct_lang))
 
             elif mtype == "staff_speak":
                 raw_text = (msg.get("text") or "").strip()
                 text = sanitize_for_llm(raw_text)
                 if not text:
                     continue
-                target = msg.get("target_lang") or sess.customer_lang
-                # Translation chain: Gemini → offline demo phrasebook.
-                if target == sess.staff_lang:
-                    cust_text = text
-                else:
-                    cust_text, _engine = await fast_translate(text, sess.staff_lang, target)
+                _ss_target = msg.get("target_lang") or sess.customer_lang
 
-                turn = ConversationTurn(
-                    role="staff",
-                    source_lang=sess.staff_lang,
-                    text_original=text,
-                    text_translated=cust_text,
-                    confidence=None,
-                )
-                sess.turns.append(turn)
-                sess.metrics.staff_turns += 1
-                sess.log_audit("staff_turn", {})
-                await _persist_turn(
-                    sess.session_id,
-                    {
-                        "role": "staff",
-                        "source_lang": sess.staff_lang,
-                        "text_original": text,
-                        "text_translated": cust_text,
-                        "confidence": None,
-                        "ts": turn.ts,
-                    },
-                )
-                await websocket.send_json(
-                    {
-                        "type": "transcript",
-                        "role": "staff",
-                        "source_lang": sess.staff_lang,
-                        "text_original": text,
-                        "text_translated": cust_text,
-                    }
-                )
-                tts_done = False
-                if not tts_done:
-                    # Browser speechSynthesis fallback — the frontend speaks the
-                    # translated text locally. This keeps the demo audible without
-                    # any external TTS API.
-                    sess.metrics.tts_playouts += 1
-                    await websocket.send_json(
-                        {
-                            "type": "tts_fallback",
-                            "lang": target,
-                            "text": cust_text,
-                            "reason": "browser_native_tts",
-                        }
-                    )
+                async def _handle_staff_speak(text: str, target: str):
+                    try:
+                        if target == sess.staff_lang:
+                            cust_text = text
+                        else:
+                            cust_text, _engine = await fast_translate(text, sess.staff_lang, target)
+
+                        turn = ConversationTurn(
+                            role="staff",
+                            source_lang=sess.staff_lang,
+                            text_original=text,
+                            text_translated=cust_text,
+                            confidence=None,
+                        )
+                        sess.turns.append(turn)
+                        sess.metrics.staff_turns += 1
+                        sess.log_audit("staff_turn", {})
+
+                        # Fire-and-forget DB persistence
+                        asyncio.create_task(
+                            _persist_turn(
+                                sess.session_id,
+                                {
+                                    "role": "staff",
+                                    "source_lang": sess.staff_lang,
+                                    "text_original": text,
+                                    "text_translated": cust_text,
+                                    "confidence": None,
+                                    "ts": turn.ts,
+                                },
+                            )
+                        )
+
+                        await websocket.send_json(
+                            {
+                                "type": "transcript",
+                                "role": "staff",
+                                "source_lang": sess.staff_lang,
+                                "text_original": text,
+                                "text_translated": cust_text,
+                            }
+                        )
+                        sess.metrics.tts_playouts += 1
+                        await websocket.send_json(
+                            {
+                                "type": "tts_fallback",
+                                "lang": target,
+                                "text": cust_text,
+                                "reason": "browser_native_tts",
+                            }
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("staff_speak bg failed: %s", e)
+
+                asyncio.create_task(_handle_staff_speak(text, _ss_target))
 
             elif mtype == "end_session":
                 sess.log_audit("session_ended_by_client", {})
