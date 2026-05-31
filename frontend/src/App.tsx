@@ -1181,25 +1181,32 @@ export default function App() {
             )}
           </div>
 
-          <div className="topbar-langs">
-            <label>
-              <span>Customer</span>
-              <select
-                value={customerLang}
-                onChange={(e) => setCustomerLang(e.target.value)}
-                disabled={connected}
-                title={connected ? "End the session to change language" : "Pick the customer's language"}
-              >
-                {CUSTOMER_LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
-              </select>
-            </label>
-            <span className="lang-swap" aria-hidden>⇄</span>
-            <label>
-              <span>Staff</span>
-              <select value={staffLang} onChange={(e) => setStaffLang(e.target.value)} disabled={connected}>
-                {STAFF_LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
-              </select>
-            </label>
+          <div className="topbar-langs" style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              <label>
+                <span>Customer</span>
+                <select
+                  value={customerLang}
+                  onChange={(e) => setCustomerLang(e.target.value)}
+                  disabled={connected}
+                  title={connected ? "End the session to change language" : "Pick the customer's language"}
+                >
+                  {CUSTOMER_LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
+                </select>
+              </label>
+              <span className="lang-swap" aria-hidden>⇄</span>
+              <label>
+                <span>Staff</span>
+                <select value={staffLang} onChange={(e) => setStaffLang(e.target.value)} disabled={connected}>
+                  {STAFF_LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
+                </select>
+              </label>
+            </div>
+            {connected && (
+              <span className="lang-note" style={{ fontSize: "10px", opacity: 0.8, color: "var(--text-muted)", marginTop: "4px" }}>
+                End Session to change the staff language
+              </span>
+            )}
           </div>
 
           <div className="topbar-actions">
