@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     app_name: str = "Frontline Desk Voice Assistant (Gemini Edition)"
-    cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+    cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173,https://ideathon-tawny-iota.vercel.app"
 
     # --- Database ---
     database_url: str = "sqlite+aiosqlite:///./frontline_desk.db"
