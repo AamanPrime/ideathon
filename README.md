@@ -7,7 +7,7 @@ This project addresses the Union Bank of India iDEA 2.0 problem statement for Re
 Check out our live deployment and demo video to see BharatVaani in action!
 
 - 🌐 Live Demo: [https://ideathon-tawny-iota.vercel.app](https://ideathon-tawny-iota.vercel.app)
-- 🎥 Demo Video: [https://youtu.be/DDh81iaJinQ] (Insert Link Here)
+- 🎥 Demo Video: [https://youtu.be/DDh81iaJinQ](https://youtu.be/DDh81iaJinQ)
 
 *If accessing the live demo, make sure to allow microphone permissions in your browser.*
 
