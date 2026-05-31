@@ -1203,8 +1203,8 @@ export default function App() {
               </label>
             </div>
             {connected && (
-              <span className="lang-note" style={{ fontSize: "10px", opacity: 0.8, color: "var(--text-muted)", marginTop: "4px" }}>
-                End Session to change the staff language
+              <span className="lang-note" style={{ fontSize: "11px", color: "#ff4d4f", fontWeight: "500", marginTop: "4px" }}>
+                End Session to change the  languages
               </span>
             )}
           </div>
